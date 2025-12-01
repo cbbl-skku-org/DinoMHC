@@ -1,0 +1,86 @@
+# DinoMHC Test Configuration (10% Dataset)
+# =====================================================
+# This config uses the 10% stratified sample for quick testing
+# Created from: datasets/el/EL_Train.csv (892,539 samples)
+# Distribution maintained: 138 MHC alleles, 7.29% positive ratio
+
+# Data Configuration
+data:
+  data_dir: datasets/el/folds_10pct
+  num_workers: 16
+  use_flanks: true
+  flank_length: 5
+  max_peptide_length: 15
+  max_mhc_length: 385
+
+# Model Configuration
+model:
+  encoder_type: esm2_shared  # embedding, esm2, esm2_shared
+  dim: 128
+  num_groove_tokens: 60
+  num_fusion_layers: 1
+  num_geometry_blocks: 1
+  num_heads: 8
+  dropout: 0.1
+  task_head: 'presentation'
+  flank_pooling: 'mean'
+
+# ESM-2 Encoder Configuration (only used if encoder_type is esm2 or esm2_shared)
+esm:
+  model_name: esm2_t6_8M_UR50D
+  unfreeze_layers: 2
+  unfreeze_embeddings: false
+
+# Training Configuration
+training:
+  batch_size: 16
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  encoder_lr_factor: 0.1
+  warmup_steps: 1000
+  max_epochs: 50
+  max_steps: -1  # -1 for no limit
+  accumulate_grad_batches: 32
+  gradient_clip_val: 1.0
+  precision: bf16-mixed  # 32, 16-mixed, bf16-mixed
+
+# Loss Configuration
+loss:
+  # Allele-Balanced Focal Loss handles both class and allele imbalance
+  use_allele_balanced_loss: true
+
+  # Focal loss parameters (for class imbalance: negative vs positive)
+  focal_alpha: 0.25  # Weight for positive class
+  focal_gamma: 2.0   # Focusing parameter (higher = more focus on hard examples)
+
+  # Allele balancing parameters (for allele imbalance)
+  allele_weight_type: inverse_freq  # 'inverse_freq' or 'effective_num'
+  allele_beta: 0.9999  # Only used if allele_weight_type='effective_num'
+  normalize_allele_weights: true  # Normalize weights to mean=1
+
+  # Standard BCE options (only used if use_allele_balanced_loss is false)
+  pos_weight: null  # null or float
+  label_smoothing: 0.0
+
+# Callbacks Configuration
+callbacks:
+  patience: 10
+  save_top_k: 3
+
+# Hardware Configuration
+hardware:
+  gpus: 1
+  strategy: auto
+
+# Logging Configuration
+logging:
+  experiment_name: dinomhc_test_10pct
+  output_dir: outputs
+  use_wandb: false
+  wandb_project: dinomhc
+  wandb_entity: null
+
+# Miscellaneous
+misc:
+  seed: 69
+  debug: false
