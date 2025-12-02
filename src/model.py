@@ -2012,15 +2012,17 @@ class BindingAffinityHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(dim // 4, 1)
         )
+        
+        self.flank_proj = nn.Linear(dim * 2, dim) if use_flanks else None
 
     def forward(self, x: torch.Tensor, flank_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             x: Interface representation [batch, dim]
-            flank_features: Optional [batch, 2*dim] with [nflank_pool, cflank_pool]
+            flank_features: Optional [batch, 2, dim] with [nflank_pool, cflank_pool]
         """
         if self.use_flanks and flank_features is not None:
-            x = x + torch.sum(flank_features, dim=-2)
+            x = x + self.flank_proj(flank_features.flatten(-2, -1))
         return self.head(x)
 
 
@@ -2041,15 +2043,17 @@ class PresentationHead(nn.Module):
             nn.Linear(dim // 2, 1),
             nn.Sigmoid()
         )
+        
+        self.flank_proj = nn.Linear(dim * 2, dim) if use_flanks else None
 
     def forward(self, x: torch.Tensor, flank_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             x: Interface representation [batch, dim]
-            flank_features: Optional [batch, 2*dim] with [nflank_pool, cflank_pool]
+            flank_features: Optional [batch, 2, dim] with [nflank_pool, cflank_pool]
         """
         if self.use_flanks and flank_features is not None:
-            x = x + torch.sum(flank_features, dim=-2)
+            x = x + self.flank_proj(flank_features.flatten(-2, -1))
         return self.head(x)
 
 

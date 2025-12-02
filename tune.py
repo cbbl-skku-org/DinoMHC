@@ -297,7 +297,7 @@ def train_folds_parallel(
     n_gpus: int,
 ) -> List[Optional[float]]:
     """Train multiple folds in parallel on multiple GPUs.
-    
+
     Args:
         config: Configuration dictionary
         trial_number: Optuna trial number
@@ -305,45 +305,49 @@ def train_folds_parallel(
         max_epochs: Maximum epochs per fold
         n_folds: Number of folds
         n_gpus: Number of available GPUs
-    
+
     Returns:
         List of AUPRC scores for each fold
     """
-    # Assign GPUs to folds (round-robin if n_folds > n_gpus)
-    fold_gpu_assignments = [(fold, fold % n_gpus) for fold in range(n_folds)]
-    
-    # Prepare arguments for each fold
-    worker_args = [
-        (config, fold, trial_number, str(output_dir), max_epochs, gpu_id)
-        for fold, gpu_id in fold_gpu_assignments
-    ]
-    
     # Run folds in parallel using multiprocessing
     # Use spawn to avoid CUDA issues with fork
     ctx = mp.get_context('spawn')
-    
+
     fold_auprcs = [None] * n_folds
 
-    # Run all folds in parallel (not batched) to maximize GPU utilization
-    # Each fold uses ~5GB VRAM, so multiple folds can share a GPU
-    with ProcessPoolExecutor(max_workers=n_folds, mp_context=ctx) as executor:
-        futures = {executor.submit(train_fold_worker, args): args[1] for args in worker_args}
+    # Process folds in batches equal to n_gpus to ensure balanced GPU utilization
+    # This prevents GPU 0 from being overloaded when n_folds > n_gpus
+    for batch_start in range(0, n_folds, n_gpus):
+        batch_end = min(batch_start + n_gpus, n_folds)
+        batch_folds = list(range(batch_start, batch_end))
 
-        for future in as_completed(futures):
-            fold = futures[future]
-            try:
-                result_fold, auprc = future.result()
-                fold_auprcs[result_fold] = auprc
-                print(f"    Fold {result_fold} completed: AUPRC = {auprc:.4f}" if auprc else f"    Fold {result_fold} FAILED")
-            except Exception as e:
-                import traceback
-                print(f"    Fold {fold} raised exception: {e}")
-                traceback.print_exc()
-                fold_auprcs[fold] = None
+        # Assign each fold in this batch to a unique GPU
+        worker_args = [
+            (config, fold, trial_number, str(output_dir), max_epochs, i)
+            for i, fold in enumerate(batch_folds)
+        ]
 
-    # Clean up GPU memory after all folds complete
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        print(f"    Processing folds {batch_folds} on GPUs {list(range(len(batch_folds)))}")
+
+        # Run this batch of folds in parallel
+        with ProcessPoolExecutor(max_workers=len(batch_folds), mp_context=ctx) as executor:
+            futures = {executor.submit(train_fold_worker, args): args[1] for args in worker_args}
+
+            for future in as_completed(futures):
+                fold = futures[future]
+                try:
+                    result_fold, auprc = future.result()
+                    fold_auprcs[result_fold] = auprc
+                    print(f"    Fold {result_fold} completed: AUPRC = {auprc:.4f}" if auprc else f"    Fold {result_fold} FAILED")
+                except Exception as e:
+                    import traceback
+                    print(f"    Fold {fold} raised exception: {e}")
+                    traceback.print_exc()
+                    fold_auprcs[fold] = None
+
+        # Clean up GPU memory after each batch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return fold_auprcs
 
@@ -559,7 +563,7 @@ def main():
     print(f"Available GPUs: {n_gpus}")
     print(f"Parallel folds: {args.parallel_folds}")
     if args.parallel_folds and n_gpus > 1:
-        print(f"  -> Will train {min(args.n_folds, n_gpus)} folds simultaneously")
+        print(f"  -> Will train folds in batches of {n_gpus} for balanced GPU utilization")
     print()
     
     # Create sampler
