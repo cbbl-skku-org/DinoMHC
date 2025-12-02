@@ -7,7 +7,7 @@
 # Data Configuration
 data:
   data_dir: datasets/el/folds_5pct
-  num_workers: 16
+  num_workers: 4
   use_flanks: true
   flank_length: 5
   max_peptide_length: 15
@@ -74,7 +74,7 @@ hardware:
 
 # Logging Configuration
 logging:
-  experiment_name: dinomhc_test_10pct
+  experiment_name: dinomhc_test_5pct
   output_dir: outputs
   use_wandb: false
   wandb_project: dinomhc
