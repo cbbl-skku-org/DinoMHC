@@ -100,6 +100,14 @@ def parse_args():
         "--train_all_folds", action="store_true",
         help="Train on all 5 folds sequentially"
     )
+    parser.add_argument(
+        "--resume_from_checkpoint", action='store_true',
+        help="Path to checkpoint to resume training from"
+    ) # Remember that this argument will search and use the latest fold in the checkpoint path to continue training
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Enable verbose logging"
+    )
     
     # Allow overriding any config value via CLI using dot notation
     # e.g., --training.batch_size 32 --model.dim 256
@@ -228,8 +236,14 @@ def create_logger(config: Dict, fold: int):
     
     return loggers
 
+def get_current_epoch(ckpt_path: str):
+    ckpt = torch.load(ckpt_path, map_location='cpu')
+    if 'epoch' in ckpt:
+        return ckpt['epoch']
+    else:
+        return None
 
-def train_fold(config: Dict, fold: int, verbose: bool = True):
+def train_fold(config: Dict, fold: int, verbose: bool = True, resume_from_checkpoint: bool = False):
     """Train a single fold."""
     if verbose:
         print(f"\n{'='*60}")
@@ -344,7 +358,25 @@ def train_fold(config: Dict, fold: int, verbose: bool = True):
     # Train
     if verbose:
         print("Starting training...")
-    trainer.fit(model, data_module)
+    
+    if resume_from_checkpoint:
+        ckpt_path = Path(config['logging']['output_dir']) / config['logging']['experiment_name'] / f"fold_{fold}" / "checkpoints" / "last.ckpt"
+        if ckpt_path.exists():
+            current_epoch = get_current_epoch(str(ckpt_path))
+            if current_epoch is not None and current_epoch < config['training']['max_epochs']:
+                if verbose:
+                    print(f"Resuming training from checkpoint: {ckpt_path} at epoch {current_epoch}")
+                trainer.fit(model, data_module, ckpt_path=ckpt_path)
+            else:
+                if verbose:
+                    print(f"Checkpoint epoch {current_epoch} >= max_epochs {config['training']['max_epochs']}. Starting fresh training.")
+                return {
+                    'fold': fold,
+                    'best_ckpt': str(ckpt_path),
+                    'best_auprc': None,
+                }
+    else:
+        trainer.fit(model, data_module)
     
     # Get best checkpoint path and score
     best_ckpt = callbacks[0].best_model_path
@@ -408,7 +440,8 @@ def main():
     
     if args.train_all_folds:
         for fold in range(5):
-            result = train_fold(config, fold)
+            print('ARGS:', args.resume_from_checkpoint)
+            result = train_fold(config, fold, args.verbose, args.resume_from_checkpoint)
             results.append(result)
         
         # Print summary
@@ -424,7 +457,8 @@ def main():
             avg_auprc = sum(r['best_auprc'] for r in valid_results) / len(valid_results)
             print(f"\n  Average AUPRC: {avg_auprc:.4f}")
     else:
-        result = train_fold(config, args.fold)
+        print('ARGS:', args.resume_from_checkpoint)
+        result = train_fold(config, args.fold, args.verbose, args.resume_from_checkpoint)
         results.append(result)
     
     # Save results
