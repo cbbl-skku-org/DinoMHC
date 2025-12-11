@@ -309,8 +309,20 @@ def train_fold(config: Dict, fold: int, verbose: bool = True, resume_from_checkp
         module_kwargs['allele_beta'] = config['loss'].get('allele_beta', 0.9999)
         module_kwargs['normalize_allele_weights'] = config['loss']['normalize_allele_weights']
 
+    use_contrastive_loss = config['loss'].get('use_contrastive_loss', False)
+    if use_contrastive_loss:
+        module_kwargs['focal_alpha'] = config['loss']['focal_alpha']
+        module_kwargs['focal_gamma'] = config['loss']['focal_gamma']
+        module_kwargs['contrastive_weight'] = config['loss']['contrastive_weight']
+        module_kwargs['temperature'] = config['loss']['temperature']
+        module_kwargs['use_allele_balancing'] = use_allele_balanced_loss
+        module_kwargs['allele_weight_type'] = config['loss']['allele_weight_type']
+        module_kwargs['allele_beta'] = config['loss'].get('allele_beta', 0.9999)
+        module_kwargs['normalize_allele_weights'] = config['loss']['normalize_allele_weights']
+    
     model = create_lightning_module(
         use_allele_balanced_loss=use_allele_balanced_loss,
+        use_contrastive_loss=use_contrastive_loss,
         **module_kwargs
     )
     
@@ -352,7 +364,7 @@ def train_fold(config: Dict, fold: int, verbose: bool = True, resume_from_checkp
         deterministic=True,
         log_every_n_steps=50,
         val_check_interval=1.0,
-        num_sanity_val_steps=2,
+        num_sanity_val_steps=2
     )
     
     # Train

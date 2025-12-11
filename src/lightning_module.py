@@ -673,6 +673,11 @@ class DinoMHCLightningModule(pl.LightningModule):
         else:
             self._test_per_mhc_metrics = per_mhc_metrics
     
+    def on_test_epoch_start(self):
+        self.test_predictions = []
+        self.test_targets = []
+        self.test_mhc_names = []
+    
     def test_step(
         self,
         batch: Dict[str, torch.Tensor],
@@ -769,10 +774,6 @@ class DinoMHCLightningModule(pl.LightningModule):
                 print(f"  Macro MCC: {macro_metrics.get('test/macro_mcc_opt', 0.0):.4f}")
                 print("=" * 80 + "\n")
 
-        # Clear stored predictions
-        self.test_predictions = []
-        self.test_targets = []
-        self.test_mhc_names = []
     
     def predict_step(
         self,
@@ -1092,6 +1093,231 @@ class AlleleBalancedFocalLoss(nn.Module):
             return loss.mean()
 
 
+class DualEncoderContrastiveLoss(nn.Module):
+    """
+    Dual-Encoder Contrastive Loss for peptide-MHC binding prediction.
+
+    This loss learns separate embeddings for peptides and MHCs, then combines them
+    to predict binding. It handles cross-reactive binding (same peptide binding to
+    multiple alleles) by using peptide sequence as the primary grouping factor.
+
+    Key principles:
+    1. Same peptide + both bind → Positives (even if different MHCs)
+    2. Same peptide + different outcomes → Negatives
+    3. Same MHC + both bind → Positives (learn allele motifs)
+
+    Args:
+        temperature: Temperature parameter for softmax in contrastive loss
+        use_hard_negatives: Whether to use hard negative mining
+    """
+
+    def __init__(self, temperature: float = 0.07, use_hard_negatives: bool = True):
+        super().__init__()
+        self.temperature = temperature
+        self.use_hard_negatives = use_hard_negatives
+
+    def forward(
+        self,
+        peptide_emb: torch.Tensor,
+        mhc_emb: torch.Tensor,
+        labels: torch.Tensor,
+        peptide_seqs: List[str],
+        mhc_names: List[str]
+    ) -> torch.Tensor:
+        """
+        Args:
+            peptide_emb: [batch, hidden_dim] - peptide-only embeddings
+            mhc_emb: [batch, hidden_dim] - MHC-only embeddings
+            labels: [batch] - binding labels (1=binder, 0=non-binder)
+            peptide_seqs: [batch] - peptide sequences (strings)
+            mhc_names: [batch] - MHC allele names (strings)
+
+        Returns:
+            loss: Scalar contrastive loss
+        """
+        # Normalize embeddings
+        peptide_emb = F.normalize(peptide_emb, dim=1)
+        mhc_emb = F.normalize(mhc_emb, dim=1)
+
+        batch_size = peptide_emb.shape[0]
+
+        # Peptide-peptide similarity
+        peptide_sim = torch.matmul(peptide_emb, peptide_emb.T) / self.temperature
+
+        # MHC-MHC similarity
+        mhc_sim = torch.matmul(mhc_emb, mhc_emb.T) / self.temperature
+
+        # Combined interaction score (average of peptide and MHC similarities)
+        interaction_score = (peptide_sim + mhc_sim) / 2
+
+        # Create comparison masks
+        same_peptide = torch.tensor([
+            [peptide_seqs[i] == peptide_seqs[j] for j in range(batch_size)]
+            for i in range(batch_size)
+        ], device=peptide_emb.device)
+
+        same_mhc = torch.tensor([
+            [mhc_names[i] == mhc_names[j] for j in range(batch_size)]
+            for i in range(batch_size)
+        ], device=peptide_emb.device)
+
+        both_binders = (labels.unsqueeze(1) == 1) & (labels.unsqueeze(0) == 1)
+        at_least_one_nonbinder = (labels.unsqueeze(1) == 0) | (labels.unsqueeze(0) == 0)
+
+        # Define positives and negatives
+        # Positives:
+        #   1. Same peptide + both bind (cross-reactivity)
+        #   2. Same MHC + different peptides + both bind (allele-specific patterns)
+        positives = (same_peptide & both_binders) | (same_mhc & ~same_peptide & both_binders)
+        positives.fill_diagonal_(False)  # Remove self-comparisons
+
+        # Negatives:
+        #   1. Same peptide + different outcomes (binding vs non-binding)
+        #   2. Different peptides + at least one non-binder
+        negatives = (same_peptide & at_least_one_nonbinder) | (~same_peptide & at_least_one_nonbinder)
+        negatives.fill_diagonal_(False)
+
+        # Compute contrastive loss
+        loss = 0
+        count = 0
+
+        for i in range(batch_size):
+            # Skip if no positives for this anchor
+            if positives[i].sum() == 0:
+                continue
+
+            pos_scores = interaction_score[i][positives[i]]
+            neg_scores = interaction_score[i][negatives[i]]
+
+            # Skip if no negatives
+            if len(neg_scores) == 0:
+                continue
+
+            if self.use_hard_negatives:
+                # Hard negative mining: use hardest negative (highest similarity)
+                hard_neg_score = neg_scores.max()
+                # For each positive, compute: log(exp(pos) / (exp(pos) + exp(hard_neg)))
+                pos_exp = torch.exp(pos_scores)
+                hard_neg_exp = torch.exp(hard_neg_score)
+                sample_loss = -torch.log(pos_exp / (pos_exp + hard_neg_exp + 1e-8)).mean()
+            else:
+                # Standard InfoNCE: all negatives
+                pos_exp = torch.exp(pos_scores)
+                neg_exp = torch.exp(neg_scores)
+                # Average over positives
+                sample_loss = -torch.log(pos_exp.mean() / (pos_exp.mean() + neg_exp.sum() + 1e-8))
+
+            loss += sample_loss
+            count += 1
+
+        return loss / max(count, 1)
+
+
+class HybridFocalContrastiveLoss(nn.Module):
+    """
+    Hybrid loss combining Focal Loss and Dual-Encoder Contrastive Loss.
+
+    - Focal Loss: Handles class imbalance and focuses on hard examples
+    - Contrastive Loss: Learns functional representations that capture cross-reactivity
+                       and allele-specific binding patterns
+
+    Args:
+        focal_alpha: Weighting factor for positive class in focal loss
+        focal_gamma: Focusing parameter for focal loss
+        contrastive_weight: Weight for contrastive loss relative to focal loss
+        temperature: Temperature for contrastive loss
+        use_allele_balancing: Whether to apply per-allele balancing in focal loss
+        allele_weight_type: Type of allele weighting ('inverse_freq' or 'effective_num')
+        allele_beta: Beta parameter for effective number weighting
+        normalize_allele_weights: Whether to normalize allele weights
+    """
+
+    def __init__(
+        self,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+        contrastive_weight: float = 0.1,
+        temperature: float = 0.07,
+        use_allele_balancing: bool = False,
+        allele_weight_type: str = 'inverse_freq',
+        allele_beta: float = 0.9999,
+        normalize_allele_weights: bool = True
+    ):
+        super().__init__()
+
+        # Focal loss component
+        if use_allele_balancing:
+            self.focal_loss = AlleleBalancedFocalLoss(
+                alpha=focal_alpha,
+                gamma=focal_gamma,
+                allele_weight_type=allele_weight_type,
+                beta=allele_beta,
+                normalize_weights=normalize_allele_weights
+            )
+        else:
+            # Simple focal loss without allele balancing
+            self.focal_loss = AlleleBalancedFocalLoss(
+                alpha=focal_alpha,
+                gamma=focal_gamma,
+                allele_weight_type='inverse_freq',
+                normalize_weights=False
+            )
+            # Don't apply allele weights
+            self.focal_loss.allele_weights = {}
+
+        # Contrastive loss component
+        self.contrastive_loss = DualEncoderContrastiveLoss(temperature=temperature)
+
+        # Loss weighting
+        self.contrastive_weight = contrastive_weight
+        self.use_allele_balancing = use_allele_balancing
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        peptide_emb: torch.Tensor,
+        mhc_emb: torch.Tensor,
+        labels: torch.Tensor,
+        peptide_seqs: List[str],
+        mhc_names: List[str]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Args:
+            logits: [batch] - binding predictions (after sigmoid)
+            peptide_emb: [batch, hidden_dim] - peptide embeddings
+            mhc_emb: [batch, hidden_dim] - MHC embeddings
+            labels: [batch] - ground truth binding labels
+            peptide_seqs: [batch] - peptide sequences
+            mhc_names: [batch] - MHC allele names
+
+        Returns:
+            total_loss: Combined loss
+            loss_dict: Dictionary with individual loss components for logging
+        """
+        # Focal loss for classification
+        if self.use_allele_balancing:
+            focal = self.focal_loss(logits, labels, mhc_names)
+        else:
+            focal = self.focal_loss(logits, labels, mhc_names=None)
+
+        # Contrastive loss for representation learning
+        contrastive = self.contrastive_loss(
+            peptide_emb, mhc_emb, labels, peptide_seqs, mhc_names
+        )
+
+        # Combined loss
+        total_loss = focal + self.contrastive_weight * contrastive
+
+        # Return individual components for logging
+        loss_dict = {
+            'focal': focal.item(),
+            'contrastive': contrastive.item(),
+            'total': total_loss.item()
+        }
+
+        return total_loss, loss_dict
+
+
 class DinoMHCWithAlleleBalancedFocalLoss(DinoMHCLightningModule):
     """
     DinoMHC Lightning Module with Allele-Balanced Focal Loss.
@@ -1252,9 +1478,219 @@ class DinoMHCWithAlleleBalancedFocalLoss(DinoMHCLightningModule):
         }
 
 
+class DinoMHCWithHybridContrastiveLoss(DinoMHCLightningModule):
+    """
+    DinoMHC Lightning Module with Hybrid Focal + Contrastive Loss.
+
+    This module combines:
+    1. Focal Loss: Handles class imbalance and focuses on hard examples
+    2. Dual-Encoder Contrastive Loss: Learns functional representations that:
+       - Capture cross-reactive binding (same peptide binding to multiple alleles)
+       - Learn allele-specific binding patterns
+       - Distinguish functional differences despite sequence similarity
+
+    The contrastive loss addresses the limitation that MHC alleles have similar
+    sequences but different binding specificities. By learning in a metric space,
+    the model can distinguish functionally different alleles even when their
+    sequences are nearly identical.
+
+    Args:
+        focal_alpha: Weighting factor for positive class (focal loss)
+        focal_gamma: Focusing parameter (focal loss)
+        contrastive_weight: Weight for contrastive loss (0.1-0.5 recommended)
+        temperature: Temperature for contrastive loss (0.07 default)
+        use_allele_balancing: Whether to apply per-allele balancing in focal loss
+        allele_weight_type: Type of allele weighting ('inverse_freq' or 'effective_num')
+        allele_beta: Beta parameter for effective number weighting
+        normalize_allele_weights: Whether to normalize allele weights
+        **kwargs: Other arguments passed to DinoMHCLightningModule
+    """
+
+    def __init__(
+        self,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+        contrastive_weight: float = 0.1,
+        temperature: float = 0.07,
+        use_allele_balancing: bool = False,
+        allele_weight_type: str = 'inverse_freq',
+        allele_beta: float = 0.9999,
+        normalize_allele_weights: bool = True,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+
+        # Replace criterion with Hybrid Focal + Contrastive Loss
+        if self.task_type in ['presentation', 'classification']:
+            self.criterion = HybridFocalContrastiveLoss(
+                focal_alpha=focal_alpha,
+                focal_gamma=focal_gamma,
+                contrastive_weight=contrastive_weight,
+                temperature=temperature,
+                use_allele_balancing=use_allele_balancing,
+                allele_weight_type=allele_weight_type,
+                allele_beta=allele_beta,
+                normalize_allele_weights=normalize_allele_weights
+            )
+            self.pos_weight = None  # Loss handles weighting internally
+
+        self.save_hyperparameters(
+            'focal_alpha', 'focal_gamma', 'contrastive_weight', 'temperature',
+            'use_allele_balancing', 'allele_weight_type', 'allele_beta',
+            'normalize_allele_weights'
+        )
+
+        # Flag to track if allele statistics have been computed
+        self._allele_stats_computed = False
+        self.use_allele_balancing = use_allele_balancing
+
+    def on_train_start(self):
+        """Compute allele statistics if using allele balancing."""
+        super().on_train_start()
+
+        if self.use_allele_balancing and not self._allele_stats_computed and hasattr(self, 'trainer'):
+            # Get training dataloader
+            train_loader = self.trainer.train_dataloader
+
+            if train_loader is not None:
+                # Count samples per allele
+                allele_counts = defaultdict(int)
+
+                # Iterate through dataset
+                if hasattr(train_loader, 'dataset'):
+                    dataset = train_loader.dataset
+                    if hasattr(dataset, 'df') and hasattr(dataset, 'mhc_column'):
+                        # Direct access to dataframe
+                        for allele in dataset.df[dataset.mhc_column]:
+                            allele_counts[allele] += 1
+                    else:
+                        # Fallback: iterate through dataset
+                        for i in range(len(dataset)):
+                            sample = dataset[i]
+                            if 'mhc_name' in sample:
+                                allele_counts[sample['mhc_name']] += 1
+
+                # Update loss function with statistics
+                if allele_counts and isinstance(self.criterion, HybridFocalContrastiveLoss):
+                    self.criterion.focal_loss.update_allele_statistics(dict(allele_counts))
+                    self._allele_stats_computed = True
+
+                    # Log statistics
+                    n_alleles = len(allele_counts)
+                    total_samples = sum(allele_counts.values())
+                    min_count = min(allele_counts.values())
+                    max_count = max(allele_counts.values())
+                    mean_count = total_samples / n_alleles
+
+                    print(f"\n{'='*60}")
+                    print(f"Allele Statistics:")
+                    print(f"  Total alleles: {n_alleles}")
+                    print(f"  Total samples: {total_samples}")
+                    print(f"  Samples per allele - Min: {min_count}, Max: {max_count}, Mean: {mean_count:.1f}")
+                    print(f"  Imbalance ratio: {max_count / min_count:.2f}x")
+                    print(f"\nAllele weights (top 10 by weight):")
+                    sorted_weights = sorted(self.criterion.focal_loss.allele_weights.items(),
+                                           key=lambda x: x[1], reverse=True)
+                    for allele, weight in sorted_weights[:10]:
+                        count = allele_counts[allele]
+                        print(f"  {allele}: weight={weight:.3f} (n={count})")
+                    print(f"{'='*60}\n")
+
+    def _compute_loss(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        peptide_emb: torch.Tensor,
+        mhc_emb: torch.Tensor,
+        peptide_seqs: List[str],
+        mhc_names: List[str]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute hybrid focal + contrastive loss."""
+        predictions = predictions.squeeze(-1)
+        targets = targets.float()
+
+        # Compute hybrid loss
+        if isinstance(self.criterion, HybridFocalContrastiveLoss):
+            return self.criterion(
+                logits=predictions,
+                peptide_emb=peptide_emb,
+                mhc_emb=mhc_emb,
+                labels=targets,
+                peptide_seqs=peptide_seqs,
+                mhc_names=mhc_names
+            )
+        else:
+            # Fallback to standard loss
+            loss = self.criterion(predictions, targets)
+            return loss, {'total': loss.item()}
+
+    def _shared_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        batch_idx: int,
+        stage: str = 'train'
+    ) -> Dict[str, torch.Tensor]:
+        """Shared step for train/val/test - modified to use contrastive loss."""
+        # Extract batch data
+        peptide_tokens = batch['peptide_tokens']
+        peptide_mask = batch['peptide_mask']
+        mhc_tokens = batch['mhc_tokens']
+        mhc_mask = batch['mhc_mask']
+        targets = batch['label']
+        mhc_names = batch.get('mhc_name', None)
+        peptide_seqs = batch.get('peptide', None)  # Get peptide sequences
+
+        # Extract flank parameters if present
+        nflank_len = batch.get('nflank_len', None)
+        cflank_len = batch.get('cflank_len', None)
+        original_peptide_len = batch.get('original_peptide_len', None)
+
+        # Forward pass
+        outputs = self(
+            peptide_tokens=peptide_tokens,
+            mhc_tokens=mhc_tokens,
+            peptide_mask=peptide_mask,
+            mhc_mask=mhc_mask,
+            nflank_len=nflank_len,
+            cflank_len=cflank_len,
+            original_peptide_len=original_peptide_len,
+            return_attention=False
+        )
+
+        predictions = outputs['prediction']
+        peptide_emb = outputs.get('peptide_emb', None)
+        mhc_emb = outputs.get('mhc_emb', None)
+
+        # Compute loss with contrastive component
+        if peptide_emb is not None and mhc_emb is not None and peptide_seqs is not None and mhc_names is not None:
+            loss, loss_dict = self._compute_loss(
+                predictions=predictions,
+                targets=targets,
+                peptide_emb=peptide_emb,
+                mhc_emb=mhc_emb,
+                peptide_seqs=peptide_seqs,
+                mhc_names=mhc_names
+            )
+
+            # Log individual loss components
+            if stage == 'train':
+                self.log(f'{stage}/loss_focal', loss_dict['focal'], prog_bar=True)
+                self.log(f'{stage}/loss_contrastive', loss_dict['contrastive'], prog_bar=True)
+        else:
+            # Fallback if embeddings not available
+            loss = self.criterion.focal_loss(predictions.squeeze(-1), targets.float(), mhc_names=mhc_names if self.use_allele_balancing else None)
+
+        return {
+            'loss': loss,
+            'predictions': predictions.squeeze(-1),
+            'targets': targets.float()
+        }
+
+
 def create_lightning_module(
     config: Optional[Dict[str, Any]] = None,
     use_allele_balanced_loss: bool = False,
+    use_contrastive_loss: bool = False,
     **kwargs
 ) -> DinoMHCLightningModule:
     """
@@ -1264,19 +1700,28 @@ def create_lightning_module(
         config: Model configuration
         use_allele_balanced_loss: Whether to use Allele-Balanced Focal Loss
                                    (for both class AND allele imbalanced data)
+        use_contrastive_loss: Whether to use Hybrid Focal + Contrastive Loss
+                              (recommended for handling sequence-similar alleles
+                               with different binding specificities)
         **kwargs: Additional arguments passed to module
 
     Returns:
         DinoMHCLightningModule instance
 
     Note:
-        - If use_allele_balanced_loss=True, uses AlleleBalancedFocalLoss
-          which handles both class imbalance (negative vs positive) and
-          allele imbalance (common vs rare alleles)
-        - If use_allele_balanced_loss=False, uses standard BCE loss with
-          optional pos_weight for class imbalance
+        - If use_contrastive_loss=True: Uses HybridFocalContrastiveLoss
+          which combines focal loss with dual-encoder contrastive learning
+          to handle cross-reactive binding and allele-specific patterns
+        - If use_allele_balanced_loss=True: Uses AlleleBalancedFocalLoss
+          which handles both class imbalance and allele imbalance
+        - If both are False: Uses standard BCE loss with optional pos_weight
+
+    Priority: use_contrastive_loss > use_allele_balanced_loss > standard loss
     """
-    if use_allele_balanced_loss:
+    if use_contrastive_loss:
+        print('=====GOHERE')
+        return DinoMHCWithHybridContrastiveLoss(config=config, **kwargs)
+    elif use_allele_balanced_loss:
         return DinoMHCWithAlleleBalancedFocalLoss(config=config, **kwargs)
     else:
         return DinoMHCLightningModule(config=config, **kwargs)
