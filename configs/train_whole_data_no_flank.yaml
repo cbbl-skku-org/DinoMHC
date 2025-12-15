@@ -8,8 +8,8 @@
 data:
   data_dir: datasets/el/NEWEST
   num_workers: 64
-  use_flanks: true
-  flank_length: 5
+  use_flanks: false
+  flank_length: 0
   max_peptide_length: 15
   max_mhc_length: 300
 
@@ -74,10 +74,10 @@ hardware:
 
 # Logging Configuration
 logging:
-  experiment_name: dinomhc_newest_esm_seperate
-  output_dir: /data/balalab/dinomhc/dinomhc_newest_esm_seperate
+  experiment_name: dinomhc_newest_esm_seperate_no_flank
+  output_dir: /data/balalab/dinomhc/dinomhc_newest_esm_seperate_no_flank
   use_wandb: false
-  wandb_project: dinomhc_newest_esm_seperate
+  wandb_project: dinomhc_newest_esm_seperate_no_flank
   wandb_entity: null
 
 # Miscellaneous
