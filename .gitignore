@@ -1,5 +1,7 @@
-# Datasets
+# Project specific ignores
 datasets/
+calculate_metrics*
+*_results
 
 # Ckpts and logs
 outputs/

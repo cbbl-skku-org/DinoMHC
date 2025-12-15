@@ -359,23 +359,23 @@ class MHCPeptideDataset(Dataset):
 def mhc_peptide_collate_fn(batch: List[Dict]) -> Dict[str, Union[torch.Tensor, List[str]]]:
     """
     Custom collate function to handle mixed tensor and string data.
-    
+
     Args:
         batch: List of sample dictionaries from dataset
-    
+
     Returns:
         Collated batch with tensors stacked and strings as lists
     """
     result = {}
-    
+
     for key in batch[0].keys():
-        if key == 'mhc_name':
+        if key in ['mhc_name', 'peptide_seq']:
             # Keep as list of strings
             result[key] = [sample[key] for sample in batch]
         else:
             # Stack tensors
             result[key] = torch.stack([sample[key] for sample in batch])
-    
+
     return result
 
 

@@ -2782,11 +2782,6 @@ class DinoMHC(nn.Module):
                 'fusion': fusion_attn
             }
 
-        # Store intermediate embeddings for contrastive learning
-        # Pool peptide and MHC embeddings for dual-encoder contrastive loss
-        outputs['peptide_emb'] = peptide_emb.mean(dim=1)  # [batch, dim] - mean pooling over sequence
-        outputs['mhc_emb'] = mhc_emb.mean(dim=1)  # [batch, dim] - mean pooling over sequence
-
         return outputs 
 # END============================================================================
 # Main Net
