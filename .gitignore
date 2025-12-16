@@ -2,6 +2,7 @@
 datasets/
 calculate_metrics*
 *_results
+exp_*
 
 # Ckpts and logs
 outputs/

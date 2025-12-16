@@ -60,9 +60,9 @@ def simple_tokenize(
     if len(tokens) > max_length:
         tokens = tokens[:max_length]
     
-    # Create mask
+    # Create mask - 'X' (unknown) tokens are masked as False (not trained)
     seq_len = len(tokens)
-    mask = [True] * seq_len + [False] * (max_length - seq_len)
+    mask = [(t != AA_VOCAB['X']) for t in tokens] + [False] * (max_length - seq_len)
     
     # Pad tokens
     tokens = tokens + [pad_token] * (max_length - seq_len)
@@ -72,17 +72,18 @@ def simple_tokenize(
 
 class ESMTokenizer:
     """
-    Wrapper for ESM-2 tokenization.
+    Wrapper for ESM-2 tokenization using Hugging Face Transformers.
     Handles batch tokenization with proper padding.
     """
-    def __init__(self, model_name: str = "esm2_t6_8M_UR50D"):
+    def __init__(self, model_name: str = "facebook/esm2_t6_8M_UR50D"):
         try:
-            import esm
-            _, self.alphabet = esm.pretrained.load_model_and_alphabet(model_name)
-            self.batch_converter = self.alphabet.get_batch_converter()
-            self.padding_idx = self.alphabet.padding_idx
+            from transformers import EsmTokenizer
+            self.tokenizer = EsmTokenizer.from_pretrained(model_name)
+            self.padding_idx = self.tokenizer.pad_token_id
+            self.cls_idx = self.tokenizer.cls_token_id  # BOS token
+            self.eos_idx = self.tokenizer.eos_token_id
         except ImportError:
-            raise ImportError("ESM package not found. Install with: pip install fair-esm")
+            raise ImportError("Transformers package not found. Install with: pip install transformers")
     
     def tokenize(
         self, 
@@ -92,8 +93,8 @@ class ESMTokenizer:
         """
         Tokenize a single sequence.
         
-        ESM adds BOS and EOS tokens:
-        [BOS, seq..., EOS, PAD...]
+        ESM adds BOS (CLS) and EOS tokens:
+        [CLS, seq..., EOS, PAD...]
         
         Args:
             sequence: Amino acid sequence string
@@ -103,31 +104,26 @@ class ESMTokenizer:
             tokens: [max_length] token indices including BOS/EOS
             mask: [max_length] boolean mask (True = non-padding)
         """
-        # Use batch converter for single sequence
-        data = [("seq", sequence)]
-        _, _, tokens = self.batch_converter(data)
-        tokens = tokens.squeeze(0)  # [seq_len + 2] (BOS + seq + EOS)
+        # Tokenize using transformers
+        encoded = self.tokenizer(
+            sequence,
+            add_special_tokens=True,
+            truncation=True,
+            max_length=max_length,
+            padding='max_length',
+            return_tensors='pt'
+        )
         
-        actual_len = tokens.shape[0]
+        tokens = encoded['input_ids'].squeeze(0)  # [max_length]
+        attention_mask = encoded['attention_mask'].squeeze(0)  # [max_length]
         
-        # Truncate if necessary (keep BOS at start and EOS at end)
-        if actual_len > max_length:
-            # Keep BOS, truncate middle, keep EOS
-            tokens = torch.cat([
-                tokens[:1],  # BOS
-                tokens[1:max_length-1],  # Truncated sequence
-                tokens[-1:]  # EOS
-            ])
-            actual_len = max_length
+        # Convert attention mask to boolean (True = non-padding)
+        mask = attention_mask.bool()
         
-        # Create mask (True for non-padding tokens)
-        mask = tokens != self.padding_idx
-        
-        # Pad if necessary
-        if actual_len < max_length:
-            padding = torch.full((max_length - actual_len,), self.padding_idx, dtype=tokens.dtype)
-            tokens = torch.cat([tokens, padding])
-            mask = torch.cat([mask, torch.zeros(max_length - actual_len, dtype=torch.bool)])
+        # Mask 'X' (unknown) tokens as False (not trained)
+        # ESM tokenizer maps 'X' to token id 24
+        x_token_id = self.tokenizer.convert_tokens_to_ids('X')
+        mask = mask & (tokens != x_token_id)
         
         return tokens, mask
     
@@ -147,15 +143,24 @@ class ESMTokenizer:
             tokens: [batch, max_length] token indices
             mask: [batch, max_length] boolean mask
         """
-        tokens_list = []
-        masks_list = []
+        # Batch tokenization using transformers
+        encoded = self.tokenizer(
+            sequences,
+            add_special_tokens=True,
+            truncation=True,
+            max_length=max_length,
+            padding='max_length',
+            return_tensors='pt'
+        )
         
-        for seq in sequences:
-            tokens, mask = self.tokenize(seq, max_length)
-            tokens_list.append(tokens)
-            masks_list.append(mask)
+        tokens = encoded['input_ids']  # [batch, max_length]
+        mask = encoded['attention_mask'].bool()  # [batch, max_length]
         
-        return torch.stack(tokens_list), torch.stack(masks_list)
+        # Mask 'X' (unknown) tokens as False (not trained)
+        x_token_id = self.tokenizer.convert_tokens_to_ids('X')
+        mask = mask & (tokens != x_token_id)
+        
+        return tokens, mask
 
 
 class MHCPeptideDataset(Dataset):
@@ -174,7 +179,7 @@ class MHCPeptideDataset(Dataset):
         data_path: str,
         mhc_seq_path: Optional[str] = None,
         tokenizer_type: str = 'embedding',  # 'embedding' or 'esm2'
-        esm_model_name: str = 'esm2_t6_8M_UR50D',
+        esm_model_name: str = 'facebook/esm2_t6_8M_UR50D',
         max_peptide_length: int = 15,
         max_mhc_length: int = 385,  # MHC-I pseudo sequence length + BOS/EOS for ESM
         use_flanks: bool = False,
@@ -398,7 +403,7 @@ class MHCPeptideDataModule(pl.LightningDataModule):
         batch_size: int = 32,
         num_workers: int = 4,
         tokenizer_type: str = 'embedding',
-        esm_model_name: str = 'esm2_t6_8M_UR50D',
+        esm_model_name: str = 'facebook/esm2_t6_8M_UR50D',
         max_peptide_length: int = 15,
         max_mhc_length: int = 385,
         use_flanks: bool = False,

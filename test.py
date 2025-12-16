@@ -59,7 +59,7 @@ def load_config(config_path: str) -> Dict[str, Any]:
 
 def get_model_config(config: Dict) -> Dict[str, Any]:
     """Build model configuration from config dict."""
-    return {
+    model_config = {
         'dim': config['model']['dim'],
         'num_groove_tokens': config['model']['num_groove_tokens'],
         'num_fusion_layers': config['model']['num_fusion_layers'],
@@ -74,7 +74,15 @@ def get_model_config(config: Dict) -> Dict[str, Any]:
         'esm_model_name': config['esm']['model_name'],
         'esm_unfreeze_layers': config['esm']['unfreeze_layers'],
         'esm_unfreeze_embeddings': config['esm']['unfreeze_embeddings'],
+        # Quantization and LoRA options
+        'esm_quantization': config['esm'].get('quantization', None),
+        'esm_use_lora': config['esm'].get('use_lora', False),
+        'esm_lora_r': config['esm'].get('lora_r', 8),
+        'esm_lora_alpha': config['esm'].get('lora_alpha', 16),
+        'esm_lora_dropout': config['esm'].get('lora_dropout', 0.1),
+        'esm_lora_target_modules': config['esm'].get('lora_target_modules', None),
     }
+    return model_config
 
 def parse_args():
     """Parse command line arguments."""
@@ -261,11 +269,12 @@ def test_benchmark(
     # Determine which module class to use based on checkpoint
     ckpt = torch.load(checkpoint_path, map_location=device)
     
-    
+    model_config = {'config': get_model_config(config)}
     
     model = create_lightning_module(
-        config=config['model'],
+        # config=config['model'],
         use_allele_balanced_loss=config['loss'].get('use_allele_balanced_loss', False),
+        **model_config
     )
     
     model.load_state_dict(ckpt['state_dict'], strict=True)
@@ -364,8 +373,8 @@ def test_benchmark(
         # Save per-MHC detailed results
         if per_mhc_metrics and save_predictions:
             per_mhc_df = pd.DataFrame.from_dict(per_mhc_metrics, orient='index')
-            per_mhc_csv_path = output_path / f"{dataset_name}_per_mhc_metrics.csv"
-            per_mhc_df.to_csv(per_mhc_csv_path, index_label='mhc_allele')
+            per_mhc_csv_path = output_path / f"{dataset_name}_per_mhc_metrics.tsv"
+            per_mhc_df.to_csv(per_mhc_csv_path, index_label='mhc_allele', sep='\t')
             if verbose:
                 print(f"\n  Per-MHC metrics saved to: {per_mhc_csv_path}")
 
@@ -396,8 +405,8 @@ def test_benchmark(
                 df['score'] = all_preds
 
                 # Save predictions
-                pred_csv_path = output_path / f"{dataset_name}_predictions.csv"
-                df.to_csv(pred_csv_path, index=False)
+                pred_csv_path = output_path / f"{dataset_name}_predictions.tsv"
+                df.to_csv(pred_csv_path, index=False, sep='\t')
 
                 if verbose:
                     print(f"Predictions saved to: {pred_csv_path}")

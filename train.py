@@ -147,7 +147,7 @@ def parse_args():
 
 def get_model_config(config: Dict) -> Dict[str, Any]:
     """Build model configuration from config dict."""
-    return {
+    model_config = {
         'dim': config['model']['dim'],
         'num_groove_tokens': config['model']['num_groove_tokens'],
         'num_fusion_layers': config['model']['num_fusion_layers'],
@@ -162,7 +162,15 @@ def get_model_config(config: Dict) -> Dict[str, Any]:
         'esm_model_name': config['esm']['model_name'],
         'esm_unfreeze_layers': config['esm']['unfreeze_layers'],
         'esm_unfreeze_embeddings': config['esm']['unfreeze_embeddings'],
+        # Quantization and LoRA options
+        'esm_quantization': config['esm'].get('quantization', None),
+        'esm_use_lora': config['esm'].get('use_lora', False),
+        'esm_lora_r': config['esm'].get('lora_r', 8),
+        'esm_lora_alpha': config['esm'].get('lora_alpha', 16),
+        'esm_lora_dropout': config['esm'].get('lora_dropout', 0.1),
+        'esm_lora_target_modules': config['esm'].get('lora_target_modules', None),
     }
+    return model_config
 
 
 def create_callbacks(config: Dict, fold: int) -> list:

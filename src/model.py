@@ -2013,7 +2013,7 @@ class BindingAffinityHead(nn.Module):
             nn.Linear(dim // 4, 1)
         )
         
-        self.flank_proj = nn.Linear(dim * 2, dim) if use_flanks else None
+        # self.flank_proj = nn.Linear(dim * 2, dim) if use_flanks else None
 
     def forward(self, x: torch.Tensor, flank_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -2021,8 +2021,8 @@ class BindingAffinityHead(nn.Module):
             x: Interface representation [batch, dim]
             flank_features: Optional [batch, 2, dim] with [nflank_pool, cflank_pool]
         """
-        if self.use_flanks and flank_features is not None:
-            x = x + self.flank_proj(flank_features.flatten(-2, -1))
+        # if self.use_flanks and flank_features is not None:
+        #     x = x + self.flank_proj(flank_features.flatten(-2, -1))
         return self.head(x)
 
 
@@ -2044,7 +2044,7 @@ class PresentationHead(nn.Module):
             nn.Sigmoid()
         )
         
-        self.flank_proj = nn.Linear(dim * 2, dim) if use_flanks else None
+        # self.flank_proj = nn.Linear(dim * 2, dim) if use_flanks else None
 
     def forward(self, x: torch.Tensor, flank_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -2052,8 +2052,8 @@ class PresentationHead(nn.Module):
             x: Interface representation [batch, dim]
             flank_features: Optional [batch, 2, dim] with [nflank_pool, cflank_pool]
         """
-        if self.use_flanks and flank_features is not None:
-            x = x + self.flank_proj(flank_features.flatten(-2, -1))
+        # if self.use_flanks and flank_features is not None:
+        #     x = x + self.flank_proj(flank_features.flatten(-2, -1))
         return self.head(x)
 
 
@@ -2125,54 +2125,307 @@ class EmbeddingEncoder(nn.Module):
         return x
 
 
+# class ESM2Encoder(nn.Module):
+#     """
+#     ESM-2 based encoder with configurable layer unfreezing.
+    
+#     Supports:
+#     - Loading pretrained ESM-2 8M model
+#     - Freezing/unfreezing specific layers for fine-tuning
+#     - Projection to match model dimension
+    
+#     ESM-2 8M has 6 transformer layers (0-5).
+#     Common strategies:
+#     - Freeze all: unfreeze_layers=0 (feature extraction)
+#     - Unfreeze last N: unfreeze_layers=N (fine-tuning)
+#     - Unfreeze all: unfreeze_layers=-1 (full fine-tuning)
+    
+#     Note on masking:
+#     ESM-2 uses its own internal attention mechanism that produces different
+#     representations based on sequence length/context. The mask parameter
+#     here is used to zero out padded positions in the OUTPUT, which is the
+#     correct behavior for downstream modules. However, for proper batching
+#     with variable-length sequences, ensure tokens are properly padded using
+#     ESM's padding token (alphabet.padding_idx).
+#     """
+#     def __init__(
+#         self,
+#         output_dim: int,
+#         model_name: str = "facebook/esm2_t33_650M_UR50D",
+#         unfreeze_layers: int = 3,  # Number of top layers to unfreeze (0=freeze all, -1=unfreeze all)
+#         unfreeze_embeddings: bool = False
+#     ):
+#         super().__init__()
+#         self.output_dim = output_dim
+#         self.unfreeze_layers = unfreeze_layers
+#         self.unfreeze_embeddings = unfreeze_embeddings
+        
+#         # Load ESM-2 model
+#         try:
+#             import esm
+#             self.esm_model, self.alphabet = esm.pretrained.load_model_and_alphabet(model_name)
+#             self.esm_dim = self.esm_model.embed_dim  # 320 for 8M model
+#             self.num_layers = self.esm_model.num_layers  # 6 for 8M model
+#             self.padding_idx = self.alphabet.padding_idx  # ESM's padding token
+#         except ImportError:
+#             raise ImportError(
+#                 "ESM package not found. Install with: pip install fair-esm"
+#             )
+#         except Exception as e:
+#             raise RuntimeError(f"Failed to load ESM model '{model_name}': {e}")
+        
+#         # Projection layer if dimensions don't match
+#         if self.esm_dim != output_dim:
+#             self.proj = nn.Linear(self.esm_dim, output_dim)
+#         else:
+#             self.proj = nn.Identity()
+        
+#         self.norm = LayerNorm(output_dim)
+        
+#         # Apply freezing strategy
+#         self._apply_freeze_strategy()
+    
+#     def _apply_freeze_strategy(self):
+#         """Apply layer freezing based on configuration."""
+#         # First, freeze everything
+#         for param in self.esm_model.parameters():
+#             param.requires_grad = False
+        
+#         if self.unfreeze_layers == -1:
+#             # Unfreeze all layers
+#             for param in self.esm_model.parameters():
+#                 param.requires_grad = True
+#         elif self.unfreeze_layers > 0:
+#             # Unfreeze top N transformer layers
+#             # ESM-2 layers are indexed 0 to num_layers-1
+#             layers_to_unfreeze = list(range(
+#                 self.num_layers - self.unfreeze_layers, 
+#                 self.num_layers
+#             ))
+            
+#             for layer_idx in layers_to_unfreeze:
+#                 if hasattr(self.esm_model, 'layers'):
+#                     # ESM-2 structure
+#                     for param in self.esm_model.layers[layer_idx].parameters():
+#                         param.requires_grad = True
+            
+#             # Also unfreeze the final layer norm if it exists
+#             if hasattr(self.esm_model, 'emb_layer_norm_after'):
+#                 for param in self.esm_model.emb_layer_norm_after.parameters():
+#                     param.requires_grad = True
+        
+#         # Optionally unfreeze embeddings
+#         if self.unfreeze_embeddings:
+#             if hasattr(self.esm_model, 'embed_tokens'):
+#                 for param in self.esm_model.embed_tokens.parameters():
+#                     param.requires_grad = True
+        
+#         # Projection layer is always trainable
+#         if hasattr(self.proj, 'parameters'):
+#             for param in self.proj.parameters():
+#                 param.requires_grad = True
+    
+#     def get_trainable_params_info(self) -> Dict[str, int]:
+#         """Get information about trainable parameters."""
+#         total = sum(p.numel() for p in self.parameters())
+#         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+#         frozen = total - trainable
+        
+#         return {
+#             'total': total,
+#             'trainable': trainable,
+#             'frozen': frozen,
+#             'trainable_pct': 100 * trainable / total if total > 0 else 0
+#         }
+    
+#     def forward(
+#         self, 
+#         tokens: torch.Tensor,
+#         mask: Optional[torch.Tensor] = None
+#     ) -> torch.Tensor:
+#         """
+#         Args:
+#             tokens: [batch, seq_len] ESM token indices (includes BOS/EOS/PAD)
+#             mask: [batch, seq_len] boolean mask where True = valid, False = padding
+#                   Note: ESM's mask marks BOS and EOS as valid (non-padding)
+#         Returns:
+#             embeddings: [batch, seq_len-1, output_dim] - BOS removed, EOS zeroed
+        
+#         Note:
+#             ESM tokenization: [BOS, seq..., EOS, PAD...]
+#             - BOS is always at position 0
+#             - EOS is at variable position (right after the sequence)
+#             - PAD fills the rest
+            
+#             This method:
+#             1. Removes BOS (position 0) from output
+#             2. Marks EOS as invalid so it gets zeroed
+#             3. Applies mask to zero out EOS and PAD positions
+#         """
+#         # ESM forward pass
+#         results = self.esm_model(tokens, repr_layers=[self.num_layers])
+        
+#         # Get representations from last layer
+#         # Shape: [batch, seq_len, esm_dim]
+#         representations = results["representations"][self.num_layers]
+        
+#         # Remove BOS (position 0) from representations
+#         # Shape: [batch, seq_len-1, esm_dim]
+#         representations = representations[:, 1:, :]
+        
+#         # Project to output dimension
+#         x = self.proj(representations)
+#         x = self.norm(x)
+        
+#         # Handle masking: remove BOS from mask, mark EOS as invalid
+#         if mask is not None:
+#             # Find EOS positions and mark them as invalid
+#             eos_idx = self.alphabet.eos_idx
+#             is_eos = (tokens == eos_idx)
+#             mask_no_eos = mask.clone()
+#             mask_no_eos[is_eos] = False
+            
+#             # Remove BOS position (0) from mask
+#             mask_stripped = mask_no_eos[:, 1:]
+            
+#             # Apply mask to zero out EOS and PAD positions
+#             x = x * mask_stripped.unsqueeze(-1).float()
+        
+#         return x
+
+
 class ESM2Encoder(nn.Module):
     """
-    ESM-2 based encoder with configurable layer unfreezing.
+    ESM-2 based encoder using Hugging Face Transformers.
     
     Supports:
-    - Loading pretrained ESM-2 8M model
+    - Loading pretrained ESM-2 models from Hugging Face
     - Freezing/unfreezing specific layers for fine-tuning
     - Projection to match model dimension
+    - Quantization (4-bit/8-bit) using bitsandbytes
+    - LoRA (Low-Rank Adaptation) using PEFT
     
-    ESM-2 8M has 6 transformer layers (0-5).
+    Model options:
+    - "facebook/esm2_t6_8M_UR50D" (6 layers, 8M params)
+    - "facebook/esm2_t12_35M_UR50D" (12 layers, 35M params)
+    - "facebook/esm2_t30_150M_UR50D" (30 layers, 150M params)
+    - "facebook/esm2_t33_650M_UR50D" (33 layers, 650M params)
+    - "facebook/esm2_t36_3B_UR50D" (36 layers, 3B params)
+    
     Common strategies:
     - Freeze all: unfreeze_layers=0 (feature extraction)
     - Unfreeze last N: unfreeze_layers=N (fine-tuning)
     - Unfreeze all: unfreeze_layers=-1 (full fine-tuning)
     
-    Note on masking:
-    ESM-2 uses its own internal attention mechanism that produces different
-    representations based on sequence length/context. The mask parameter
-    here is used to zero out padded positions in the OUTPUT, which is the
-    correct behavior for downstream modules. However, for proper batching
-    with variable-length sequences, ensure tokens are properly padded using
-    ESM's padding token (alphabet.padding_idx).
+    Quantization options:
+    - quantization=None: No quantization (default)
+    - quantization='4bit': 4-bit quantization (NF4)
+    - quantization='8bit': 8-bit quantization
+    
+    LoRA options:
+    - use_lora=False: No LoRA (default)
+    - use_lora=True: Apply LoRA to attention layers
+    - lora_r: LoRA rank (default: 8)
+    - lora_alpha: LoRA alpha scaling (default: 16)
+    - lora_dropout: LoRA dropout (default: 0.1)
+    - lora_target_modules: Modules to apply LoRA (default: query, key, value)
     """
     def __init__(
         self,
         output_dim: int,
-        model_name: str = "esm2_t6_8M_UR50D",
-        unfreeze_layers: int = 2,  # Number of top layers to unfreeze (0=freeze all, -1=unfreeze all)
-        unfreeze_embeddings: bool = False
+        model_name: str = "facebook/esm2_t6_8M_UR50D",
+        unfreeze_layers: int = 2,
+        unfreeze_embeddings: bool = False,
+        # Quantization options
+        quantization: Optional[str] = None,  # None, '4bit', '8bit'
+        # LoRA options
+        use_lora: bool = False,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.1,
+        lora_target_modules: Optional[list] = None,
     ):
         super().__init__()
         self.output_dim = output_dim
         self.unfreeze_layers = unfreeze_layers
         self.unfreeze_embeddings = unfreeze_embeddings
+        self.quantization = quantization
+        self.use_lora = use_lora
         
-        # Load ESM-2 model
+        # Load ESM-2 model from Hugging Face
         try:
-            import esm
-            self.esm_model, self.alphabet = esm.pretrained.load_model_and_alphabet(model_name)
-            self.esm_dim = self.esm_model.embed_dim  # 320 for 8M model
-            self.num_layers = self.esm_model.num_layers  # 6 for 8M model
-            self.padding_idx = self.alphabet.padding_idx  # ESM's padding token
+            from transformers import EsmModel, EsmTokenizer
+            
+            # Setup quantization config if requested
+            quantization_config = None
+            if quantization is not None:
+                # Check CUDA availability for quantization
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        f"Quantization '{quantization}' requires CUDA but no GPU is available. "
+                        "Set quantization=None to use CPU."
+                    )
+                
+                try:
+                    from transformers import BitsAndBytesConfig
+                    import bitsandbytes as bnb
+                    
+                    if quantization == '4bit':
+                        quantization_config = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_quant_type="nf4",
+                            bnb_4bit_compute_dtype=torch.bfloat16,
+                            bnb_4bit_use_double_quant=True,
+                        )
+                    elif quantization == '8bit':
+                        quantization_config = BitsAndBytesConfig(
+                            load_in_8bit=True,
+                            llm_int8_skip_modules=["lm_head"],  # Skip problematic modules
+                        )
+                    else:
+                        raise ValueError(f"Unknown quantization type: {quantization}. Use '4bit' or '8bit'.")
+                except ImportError as e:
+                    raise ImportError(
+                        f"bitsandbytes package not found or error importing: {e}. "
+                        "Install with: pip install bitsandbytes>=0.41.0"
+                    )
+            
+            # Load model with or without quantization
+            if quantization_config is not None:
+                self.esm_model = EsmModel.from_pretrained(
+                    model_name,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                    torch_dtype=torch.bfloat16,
+                )
+            else:
+                self.esm_model = EsmModel.from_pretrained(model_name)
+            
+            self.tokenizer = EsmTokenizer.from_pretrained(model_name)
+            
+            self.esm_dim = self.esm_model.config.hidden_size
+            self.num_layers = self.esm_model.config.num_hidden_layers
+            self.padding_idx = self.tokenizer.pad_token_id
+            
+            # Store special token IDs for mask handling
+            self.bos_idx = self.tokenizer.cls_token_id  # ESM uses <cls> as BOS
+            self.eos_idx = self.tokenizer.eos_token_id
+            
         except ImportError:
             raise ImportError(
-                "ESM package not found. Install with: pip install fair-esm"
+                "Transformers package not found. Install with: pip install transformers"
             )
         except Exception as e:
             raise RuntimeError(f"Failed to load ESM model '{model_name}': {e}")
+        
+        # Apply LoRA if requested
+        if use_lora:
+            self._apply_lora(
+                lora_r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                lora_target_modules=lora_target_modules,
+            )
         
         # Projection layer if dimensions don't match
         if self.esm_dim != output_dim:
@@ -2182,8 +2435,86 @@ class ESM2Encoder(nn.Module):
         
         self.norm = LayerNorm(output_dim)
         
-        # Apply freezing strategy
-        self._apply_freeze_strategy()
+        # Apply freezing strategy (skip if using LoRA - LoRA handles this)
+        if not use_lora:
+            self._apply_freeze_strategy()
+        
+        # Create a fake alphabet object for compatibility with existing code
+        self._create_alphabet_compat()
+    
+    def _apply_lora(
+        self,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.1,
+        lora_target_modules: Optional[list] = None,
+    ):
+        """Apply LoRA to the ESM model using PEFT."""
+        try:
+            from peft import LoraConfig, get_peft_model, TaskType
+            
+            # Default target modules for ESM-2 attention layers
+            if lora_target_modules is None:
+                lora_target_modules = [
+                    "query",
+                    "key", 
+                    "value"
+                ]
+            
+            lora_config = LoraConfig(
+                task_type=TaskType.FEATURE_EXTRACTION,
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=lora_target_modules,
+                bias="none",
+            )
+            
+            # Wrap model with LoRA
+            self.esm_model = get_peft_model(self.esm_model, lora_config)
+            
+            # Print trainable parameters info
+            self.esm_model.print_trainable_parameters()
+            
+        except ImportError:
+            raise ImportError(
+                "PEFT package not found for LoRA. Install with: pip install peft"
+            )
+    
+    def _create_alphabet_compat(self):
+        """Create a compatibility layer for code expecting fair-esm alphabet."""
+        class AlphabetCompat:
+            def __init__(self, tokenizer):
+                self.tokenizer = tokenizer
+                self.padding_idx = tokenizer.pad_token_id
+                self.cls_idx = tokenizer.cls_token_id
+                self.eos_idx = tokenizer.eos_token_id
+                self.mask_idx = tokenizer.mask_token_id
+                
+            def get_tok(self, idx):
+                return self.tokenizer.convert_ids_to_tokens(idx)
+            
+            def get_batch_converter(self):
+                """Return a batch converter function compatible with fair-esm."""
+                def batch_converter(data):
+                    # data is list of (label, sequence) tuples
+                    labels = [d[0] for d in data]
+                    sequences = [d[1] for d in data]
+                    
+                    # Tokenize with transformers
+                    encoded = self.tokenizer(
+                        sequences,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        add_special_tokens=True
+                    )
+                    
+                    return labels, sequences, encoded['input_ids']
+                
+                return batch_converter
+        
+        self.alphabet = AlphabetCompat(self.tokenizer)
     
     def _apply_freeze_strategy(self):
         """Apply layer freezing based on configuration."""
@@ -2197,27 +2528,26 @@ class ESM2Encoder(nn.Module):
                 param.requires_grad = True
         elif self.unfreeze_layers > 0:
             # Unfreeze top N transformer layers
-            # ESM-2 layers are indexed 0 to num_layers-1
             layers_to_unfreeze = list(range(
                 self.num_layers - self.unfreeze_layers, 
                 self.num_layers
             ))
             
+            # Hugging Face ESM-2 structure: esm_model.encoder.layer[i]
             for layer_idx in layers_to_unfreeze:
-                if hasattr(self.esm_model, 'layers'):
-                    # ESM-2 structure
-                    for param in self.esm_model.layers[layer_idx].parameters():
+                if hasattr(self.esm_model, 'encoder') and hasattr(self.esm_model.encoder, 'layer'):
+                    for param in self.esm_model.encoder.layer[layer_idx].parameters():
                         param.requires_grad = True
             
-            # Also unfreeze the final layer norm if it exists
-            if hasattr(self.esm_model, 'emb_layer_norm_after'):
-                for param in self.esm_model.emb_layer_norm_after.parameters():
+            # Also unfreeze the final layer norm
+            if hasattr(self.esm_model, 'encoder') and hasattr(self.esm_model.encoder, 'emb_layer_norm_after'):
+                for param in self.esm_model.encoder.emb_layer_norm_after.parameters():
                     param.requires_grad = True
         
         # Optionally unfreeze embeddings
         if self.unfreeze_embeddings:
-            if hasattr(self.esm_model, 'embed_tokens'):
-                for param in self.esm_model.embed_tokens.parameters():
+            if hasattr(self.esm_model, 'embeddings'):
+                for param in self.esm_model.embeddings.parameters():
                     param.requires_grad = True
         
         # Projection layer is always trainable
@@ -2231,12 +2561,60 @@ class ESM2Encoder(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen = total - trainable
         
-        return {
+        info = {
             'total': total,
             'trainable': trainable,
             'frozen': frozen,
-            'trainable_pct': 100 * trainable / total if total > 0 else 0
+            'trainable_pct': 100 * trainable / total if total > 0 else 0,
+            'quantization': self.quantization,
+            'use_lora': self.use_lora,
         }
+        
+        # Add LoRA-specific info if using LoRA
+        if self.use_lora:
+            try:
+                lora_params = sum(
+                    p.numel() for n, p in self.esm_model.named_parameters() 
+                    if 'lora' in n.lower() and p.requires_grad
+                )
+                info['lora_params'] = lora_params
+            except:
+                pass
+        
+        return info
+    
+    def merge_and_unload_lora(self):
+        """Merge LoRA weights into base model and unload LoRA (for inference)."""
+        if self.use_lora:
+            try:
+                self.esm_model = self.esm_model.merge_and_unload()
+                self.use_lora = False
+                print("LoRA weights merged and unloaded successfully.")
+            except Exception as e:
+                print(f"Failed to merge LoRA: {e}")
+    
+    def save_lora_weights(self, path: str):
+        """Save only the LoRA weights to a file."""
+        if self.use_lora:
+            self.esm_model.save_pretrained(path)
+            print(f"LoRA weights saved to {path}")
+        else:
+            print("LoRA is not enabled, nothing to save.")
+    
+    def load_lora_weights(self, path: str):
+        """Load LoRA weights from a file."""
+        if self.use_lora:
+            try:
+                from peft import PeftModel
+                self.esm_model = PeftModel.from_pretrained(
+                    self.esm_model.base_model.model, 
+                    path
+                )
+                print(f"LoRA weights loaded from {path}")
+            except Exception as e:
+                print(f"Failed to load LoRA weights: {e}")
+        else:
+            print("LoRA is not enabled. Initialize with use_lora=True first.")
     
     def forward(
         self, 
@@ -2247,27 +2625,25 @@ class ESM2Encoder(nn.Module):
         Args:
             tokens: [batch, seq_len] ESM token indices (includes BOS/EOS/PAD)
             mask: [batch, seq_len] boolean mask where True = valid, False = padding
-                  Note: ESM's mask marks BOS and EOS as valid (non-padding)
         Returns:
             embeddings: [batch, seq_len-1, output_dim] - BOS removed, EOS zeroed
-        
-        Note:
-            ESM tokenization: [BOS, seq..., EOS, PAD...]
-            - BOS is always at position 0
-            - EOS is at variable position (right after the sequence)
-            - PAD fills the rest
-            
-            This method:
-            1. Removes BOS (position 0) from output
-            2. Marks EOS as invalid so it gets zeroed
-            3. Applies mask to zero out EOS and PAD positions
         """
-        # ESM forward pass
-        results = self.esm_model(tokens, repr_layers=[self.num_layers])
+        # Create attention mask for transformers (1 = attend, 0 = ignore)
+        if mask is not None:
+            attention_mask = mask.long()
+        else:
+            attention_mask = (tokens != self.padding_idx).long()
         
-        # Get representations from last layer
+        # ESM forward pass using transformers
+        outputs = self.esm_model(
+            input_ids=tokens,
+            attention_mask=attention_mask,
+            return_dict=True
+        )
+        
+        # Get last hidden state
         # Shape: [batch, seq_len, esm_dim]
-        representations = results["representations"][self.num_layers]
+        representations = outputs.last_hidden_state
         
         # Remove BOS (position 0) from representations
         # Shape: [batch, seq_len-1, esm_dim]
@@ -2280,8 +2656,7 @@ class ESM2Encoder(nn.Module):
         # Handle masking: remove BOS from mask, mark EOS as invalid
         if mask is not None:
             # Find EOS positions and mark them as invalid
-            eos_idx = self.alphabet.eos_idx
-            is_eos = (tokens == eos_idx)
+            is_eos = (tokens == self.eos_idx)
             mask_no_eos = mask.clone()
             mask_no_eos[is_eos] = False
             
@@ -2292,6 +2667,7 @@ class ESM2Encoder(nn.Module):
             x = x * mask_stripped.unsqueeze(-1).float()
         
         return x
+            
 # END============================================================================
 # Sequence Encoders
 # ===============================================================================
@@ -2342,13 +2718,19 @@ class DinoMHC(nn.Module):
             'max_peptide_length': 15,
             'task_head': 'presentation',  # 'affinity', 'presentation', 'contact'
             # Encoder configuration
-            'encoder_type': 'esm2_shared',  # 'embedding', 'esm2', 'esm2_shared'
-            'esm_model_name': 'esm2_t6_8M_UR50D',
+            'encoder_type': 'esm2',  # 'embedding', 'esm2', 'esm2_shared'
+            'esm_model_name': 'facebook/esm2_t33_650M_UR50D',
             'esm_unfreeze_layers': 2,  # Number of top layers to unfreeze
             'esm_unfreeze_embeddings': False,
             # Flank configuration
             'use_flanks': True,  # Whether to use flanking regions
-            'flank_pooling': 'mean'  # 'mean' or 'max' pooling for flanks
+            'flank_pooling': 'mean',  # 'mean' or 'max' pooling for flanks
+            'esm_quantization': None,
+            'esm_use_lora': True,
+            'esm_lora_r': 8,
+            'esm_lora_alpha': 16,
+            'esm_lora_dropout': 0.1,
+            'esm_lora_target_modules': ['query', 'key', 'value'],
         }
         
         if config is not None:
@@ -2414,6 +2796,21 @@ class DinoMHC(nn.Module):
         # Store ESM special token indices (will be None for embedding encoder)
         self._esm_eos_idx = None
         
+        # Extract ESM-specific config options
+        esm_kwargs = {
+            'output_dim': dim,
+            'model_name': config.get('esm_model_name', 'facebook/esm2_t6_8M_UR50D'),
+            'unfreeze_layers': config.get('esm_unfreeze_layers', 2),
+            'unfreeze_embeddings': config.get('esm_unfreeze_embeddings', False),
+            # Quantization and LoRA options
+            'quantization': config.get('esm_quantization', None),
+            'use_lora': config.get('esm_use_lora', False),
+            'lora_r': config.get('esm_lora_r', 8),
+            'lora_alpha': config.get('esm_lora_alpha', 16),
+            'lora_dropout': config.get('esm_lora_dropout', 0.1),
+            'lora_target_modules': config.get('esm_lora_target_modules', None),
+        }
+        
         if encoder_type == 'embedding':
             # Simple embedding encoders (separate for peptide and MHC)
             self.peptide_encoder = EmbeddingEncoder(dim)
@@ -2423,18 +2820,8 @@ class DinoMHC(nn.Module):
         elif encoder_type == 'esm2':
             # Separate ESM-2 encoders for peptide and MHC
             # Different encoders allow specialized fine-tuning
-            self.peptide_encoder = ESM2Encoder(
-                output_dim=dim,
-                model_name=config['esm_model_name'],
-                unfreeze_layers=config['esm_unfreeze_layers'],
-                unfreeze_embeddings=config['esm_unfreeze_embeddings']
-            )
-            self.mhc_encoder = ESM2Encoder(
-                output_dim=dim,
-                model_name=config['esm_model_name'],
-                unfreeze_layers=config['esm_unfreeze_layers'],
-                unfreeze_embeddings=config['esm_unfreeze_embeddings']
-            )
+            self.peptide_encoder = ESM2Encoder(**esm_kwargs)
+            self.mhc_encoder = ESM2Encoder(**esm_kwargs)
             self.shared_encoder = False
             # Store EOS index for mask adjustment
             self._esm_eos_idx = self.peptide_encoder.alphabet.eos_idx
@@ -2442,12 +2829,7 @@ class DinoMHC(nn.Module):
         elif encoder_type == 'esm2_shared':
             # Single shared ESM-2 encoder for both peptide and MHC
             # More parameter efficient, but may not capture sequence-specific features
-            self.shared_esm_encoder = ESM2Encoder(
-                output_dim=dim,
-                model_name=config['esm_model_name'],
-                unfreeze_layers=config['esm_unfreeze_layers'],
-                unfreeze_embeddings=config['esm_unfreeze_embeddings']
-            )
+            self.shared_esm_encoder = ESM2Encoder(**esm_kwargs)
             # Aliases for compatibility
             self.peptide_encoder = self.shared_esm_encoder
             self.mhc_encoder = self.shared_esm_encoder
@@ -2794,9 +3176,9 @@ if __name__ == "__main__":
     from src.data_module import MHCPeptideDataset
     
     dataset = MHCPeptideDataset(
-        data_path='/home/duongtt/Workdir/MHC/digermhc/datasets/el/folds_10pct/fold_0_val.csv',
+        data_path='/home/duongtt/Workdir/MHC/digermhc/datasets/el/NEWEST/fold_0_test_tmp.csv',
         tokenizer_type='esm2',
-        esm_model_name='esm2_t6_8M_UR50D',
+        esm_model_name='facebook/esm2_t33_650M_UR50D',
         use_flanks=True
     )
     
@@ -2807,30 +3189,16 @@ if __name__ == "__main__":
     # Find until get the length is 16
     while True:
         test_sample = dataset[i]
-        if test_sample['nflank_len'] == 5 and test_sample['cflank_len'] == 5 and test_sample['original_peptide_len'] == 15:
-            test_batch.append(test_sample)
-            i += 1
-        print(test_sample['nflank_len'], test_sample['cflank_len'], test_sample['original_peptide_len'])
-        if test_sample['nflank_len'] < 5 and test_sample['cflank_len'] == 5 and test_sample['original_peptide_len'] < 15:
-            test_batch.append(test_sample)
-            i += 1
-        elif test_sample['nflank_len'] == 5 and test_sample['cflank_len'] < 5 and test_sample['original_peptide_len'] < 15:
-            test_batch.append(test_sample)
-            i += 1
-        elif test_sample['nflank_len'] < 5 and test_sample['cflank_len'] < 5 and test_sample['original_peptide_len'] < 15:
-            test_batch.append(test_sample)
-            i += 1
-        elif test_sample['nflank_len'] == 0 and test_sample['cflank_len'] == 0 and test_sample['original_peptide_len'] < 15:
-            test_batch.append(test_sample)
-            i += 1
-        i+=1
-        if len(test_batch) > 10:
+        if 24 in test_sample['peptide_tokens']:
+            print(test_sample)
+            exit()
+        if len(test_batch) == 1:
             break
     
-    for test_sample in test_batch:
-        print(' '.join([tokenizer.alphabet.get_tok(x) for x in test_sample['peptide_tokens']]))
-        print(test_sample['peptide_mask'])
-        print('---')
+    # for test_sample in test_batch:
+    #     print(' '.join([tokenizer.alphabet.get_tok(x) for x in test_sample['peptide_tokens']]))
+    #     print(test_sample['peptide_mask'])
+    #     print('---')
         
     peptide_tokens_batch = torch.stack([sample['peptide_tokens'] for sample in test_batch], dim=0)
     mhc_tokens_batch = torch.stack([sample['mhc_tokens'] for sample in test_batch], dim=0)

@@ -30,6 +30,14 @@ esm:
   model_name: esm2_t6_8M_UR50D
   unfreeze_layers: 3
   unfreeze_embeddings: false
+  # Quantization: null, '4bit', or '8bit' (requires bitsandbytes)
+  quantization: null
+  # LoRA configuration (requires peft)
+  use_lora: false
+  lora_r: 8           # LoRA rank
+  lora_alpha: 16      # LoRA alpha scaling factor
+  lora_dropout: 0.1   # LoRA dropout
+  lora_target_modules: null  # null = default ['query', 'key', 'value']
 
 # Training Configuration
 training:
