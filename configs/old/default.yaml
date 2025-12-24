@@ -7,6 +7,7 @@ data:
   num_workers: 16
   use_flanks: false
   flank_length: 5
+  flank_mask_prob: 0.0  # Probability to randomly mask flanks during training (0.0-1.0)
   max_peptide_length: 15
   max_mhc_length: 385
 

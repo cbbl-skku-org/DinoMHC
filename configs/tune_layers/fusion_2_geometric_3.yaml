@@ -6,12 +6,15 @@
 
 # Data Configuration
 data:
-  data_dir: datasets/el/NEWEST
+  data_dir: datasets/el/MAYBE_FINAL_DATA_23DEC
   num_workers: 64
   use_flanks: true
   flank_length: 5
+  flank_mask_prob: 0.2  # Randomly mask 20% of samples' flanks during training
   max_peptide_length: 15
   max_mhc_length: 300
+  test_files: # Test after each epoch
+    - '/home/bala/digermhc/datasets/el/Experimental_Data - Original_Data.csv'
 
 # Model Configuration
 model:
@@ -19,7 +22,7 @@ model:
   dim: 128
   num_groove_tokens: 60
   num_fusion_layers: 2
-  num_geometry_blocks: 2
+  num_geometry_blocks: 3
   num_heads: 4
   dropout: 0.1
   task_head: 'presentation'
@@ -27,7 +30,7 @@ model:
 
 # ESM-2 Encoder Configuration (only used if encoder_type is esm2 or esm2_shared)
 esm:
-  model_name: esm2_t6_8M_UR50D
+  model_name: facebook/esm2_t30_150M_UR50D
   unfreeze_layers: 3
   unfreeze_embeddings: false
   # Quantization: null, '4bit', or '8bit' (requires bitsandbytes)
@@ -37,7 +40,7 @@ esm:
   lora_r: 8           # LoRA rank
   lora_alpha: 16      # LoRA alpha scaling factor
   lora_dropout: 0.1   # LoRA dropout
-  lora_target_modules: null  # null = default ['query', 'key', 'value']
+  lora_target_modules: ['query', 'key', 'value']  # null = default ['query', 'key', 'value']
 
 # Training Configuration
 training:
@@ -50,7 +53,7 @@ training:
   max_steps: -1  # -1 for no limit
   accumulate_grad_batches: 16
   gradient_clip_val: 1.0
-  precision: 32  # 32, 16-mixed, bf16-mixed
+  precision: "bf16-mixed"  # 32, 16-mixed, bf16-mixed
 
 # Loss Configuration
 loss:
@@ -72,7 +75,7 @@ loss:
 
 # Callbacks Configuration
 callbacks:
-  patience: 5
+  patience: 3
   save_top_k: 1
 
 # Hardware Configuration
@@ -82,10 +85,10 @@ hardware:
 
 # Logging Configuration
 logging:
-  experiment_name: dinomhc_newest_esm_seperate
-  output_dir: /data/balalab/dinomhc/dinomhc_newest_esm_seperate
+  experiment_name: dinomhc_fusion_2_geometric_3
+  output_dir: /data/balalab/dinomhc/tune_num_layers/dinomhc_fusion_2_geometric_3
   use_wandb: false
-  wandb_project: dinomhc_newest_esm_seperate
+  wandb_project: dinomhc_fusion_2_geometric_3
   wandb_entity: null
 
 # Miscellaneous

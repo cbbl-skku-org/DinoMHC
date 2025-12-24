@@ -6,21 +6,22 @@
 
 # Data Configuration
 data:
-  data_dir: datasets/el/NEWEST
-  num_workers: 64
-  use_flanks: false
-  flank_length: 0
+  data_dir: datasets/el/folds_10pct
+  num_workers: 16
+  use_flanks: true
+  flank_length: 5
+  flank_mask_prob: 0.2  # Randomly mask 20% of samples' flanks during training
   max_peptide_length: 15
-  max_mhc_length: 300
+  max_mhc_length: 385
 
 # Model Configuration
 model:
-  encoder_type: esm2  # embedding, esm2, esm2_shared
+  encoder_type: esm2_shared  # embedding, esm2, esm2_shared
   dim: 128
   num_groove_tokens: 60
-  num_fusion_layers: 2
-  num_geometry_blocks: 2
-  num_heads: 4
+  num_fusion_layers: 1
+  num_geometry_blocks: 1
+  num_heads: 8
   dropout: 0.1
   task_head: 'presentation'
   flank_pooling: 'mean'
@@ -28,21 +29,21 @@ model:
 # ESM-2 Encoder Configuration (only used if encoder_type is esm2 or esm2_shared)
 esm:
   model_name: esm2_t6_8M_UR50D
-  unfreeze_layers: 3
+  unfreeze_layers: 2
   unfreeze_embeddings: false
 
 # Training Configuration
 training:
-  batch_size: 32
-  learning_rate: 0.001
-  weight_decay: 0.0006
+  batch_size: 16
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
   encoder_lr_factor: 0.1
-  warmup_steps: 1500
-  max_epochs: 20
+  warmup_steps: 1000
+  max_epochs: 50
   max_steps: -1  # -1 for no limit
-  accumulate_grad_batches: 16
+  accumulate_grad_batches: 32
   gradient_clip_val: 1.0
-  precision: 32  # 32, 16-mixed, bf16-mixed
+  precision: bf16-mixed  # 32, 16-mixed, bf16-mixed
 
 # Loss Configuration
 loss:
@@ -50,37 +51,37 @@ loss:
   use_allele_balanced_loss: true
 
   # Focal loss parameters (for class imbalance: negative vs positive)
-  focal_alpha: 0.45  # Weight for positive class
+  focal_alpha: 0.25  # Weight for positive class
   focal_gamma: 2.0   # Focusing parameter (higher = more focus on hard examples)
 
   # Allele balancing parameters (for allele imbalance)
   allele_weight_type: inverse_freq  # 'inverse_freq' or 'effective_num'
   allele_beta: 0.9999  # Only used if allele_weight_type='effective_num'
   normalize_allele_weights: true  # Normalize weights to mean=1
-  
+
   # Standard BCE options (only used if use_allele_balanced_loss is false)
   pos_weight: null  # null or float
   label_smoothing: 0.0
 
 # Callbacks Configuration
 callbacks:
-  patience: 5
-  save_top_k: 1
+  patience: 10
+  save_top_k: 3
 
 # Hardware Configuration
 hardware:
-  gpus: 8
-  strategy: 'ddp_find_unused_parameters_true'
+  gpus: 1
+  strategy: auto
 
 # Logging Configuration
 logging:
-  experiment_name: dinomhc_newest_esm_seperate_no_flank
-  output_dir: /data/balalab/dinomhc/dinomhc_newest_esm_seperate_no_flank
+  experiment_name: dinomhc_test_10pct
+  output_dir: outputs
   use_wandb: false
-  wandb_project: dinomhc_newest_esm_seperate_no_flank
+  wandb_project: dinomhc
   wandb_entity: null
 
 # Miscellaneous
 misc:
-  seed: 42
+  seed: 69
   debug: false
