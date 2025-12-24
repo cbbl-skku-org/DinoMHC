@@ -170,6 +170,7 @@ def train_fold_for_tuning(
         max_mhc_length=config['data']['max_mhc_length'],
         use_flanks=config['data']['use_flanks'],
         flank_length=config['data']['flank_length'],
+        flank_mask_prob=config['data'].get('flank_mask_prob', 0.0),
         binarize_labels=True,
         label_threshold=0.5,
     )

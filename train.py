@@ -18,7 +18,7 @@ import sys
 import argparse
 import yaml
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import torch
 
@@ -29,6 +29,7 @@ try:
         EarlyStopping,
         LearningRateMonitor,
         RichProgressBar,
+        Callback,
     )
     from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 except ImportError:
@@ -38,11 +39,120 @@ except ImportError:
         EarlyStopping,
         LearningRateMonitor,
         RichProgressBar,
+        Callback,
     )
     from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
 from src.data_module import MHCPeptideDataModule
 from src.lightning_module import create_lightning_module
+
+
+class TestAfterEpochCallback(Callback):
+    """
+    Callback to run test datasets after each validation epoch.
+    
+    This allows monitoring model performance on held-out test sets
+    (e.g., experimental data) during training.
+    """
+    
+    def __init__(self, test_dataloaders: List, test_names: List[str], threshold: float = 0.5):
+        """
+        Args:
+            test_dataloaders: List of test DataLoaders
+            test_names: List of names for each test dataset (for logging)
+            threshold: Classification threshold for binary metrics (default: 0.5)
+        """
+        super().__init__()
+        self.test_dataloaders = test_dataloaders
+        self.test_names = test_names
+        self.threshold = threshold
+    
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """Run test after each validation epoch."""
+        if trainer.sanity_checking:
+            return
+        
+        # Store original test metrics state
+        original_test_predictions = getattr(pl_module, 'test_predictions', [])
+        original_test_targets = getattr(pl_module, 'test_targets', [])
+        original_test_mhc_names = getattr(pl_module, 'test_mhc_names', [])
+        
+        current_epoch = trainer.current_epoch
+        
+        for test_dl, test_name in zip(self.test_dataloaders, self.test_names):
+            # Reset test metrics
+            pl_module.test_predictions = []
+            pl_module.test_targets = []
+            pl_module.test_mhc_names = []
+            
+            if pl_module.test_metrics is not None:
+                pl_module.test_metrics.reset()
+            
+            # Run test loop manually
+            pl_module.eval()
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(test_dl):
+                    # Move batch to device
+                    batch = {k: v.to(pl_module.device) if isinstance(v, torch.Tensor) else v 
+                            for k, v in batch.items()}
+                    
+                    # Run test step
+                    pl_module.test_step(batch, batch_idx)
+            
+            # Compute and log metrics with dataset name prefix
+            if len(pl_module.test_predictions) > 0:
+                all_preds = torch.cat(pl_module.test_predictions, dim=0)
+                all_targets = torch.cat(pl_module.test_targets, dim=0)
+                
+                # Compute metrics
+                from torchmetrics.functional import (
+                    auroc, average_precision, f1_score, precision, recall,
+                    specificity, matthews_corrcoef
+                )
+                
+                try:
+                    # Threshold-independent metrics
+                    test_auroc = auroc(all_preds, all_targets.long(), task='binary').item()
+                    test_auprc = average_precision(all_preds, all_targets.long(), task='binary').item()
+                    
+                    # Apply threshold for binary predictions
+                    binary_preds = (all_preds >= self.threshold).long()
+                    targets_long = all_targets.long()
+                    
+                    # Threshold-dependent metrics
+                    test_f1 = f1_score(binary_preds, targets_long, task='binary').item()
+                    test_precision = precision(binary_preds, targets_long, task='binary').item()
+                    test_recall = recall(binary_preds, targets_long, task='binary').item()  # Sensitivity
+                    test_specificity = specificity(binary_preds, targets_long, task='binary').item()
+                    test_mcc = matthews_corrcoef(binary_preds, targets_long, task='binary').item()
+                    
+                    # Log all metrics with dataset name
+                    metrics_dict = {
+                        f'test_{test_name}/auroc': test_auroc,
+                        f'test_{test_name}/auprc': test_auprc,
+                        f'test_{test_name}/f1': test_f1,
+                        f'test_{test_name}/precision': test_precision,
+                        f'test_{test_name}/sensitivity': test_recall,  # Recall = Sensitivity
+                        f'test_{test_name}/specificity': test_specificity,
+                        f'test_{test_name}/mcc': test_mcc,
+                    }
+                    
+                    for metric_name, metric_value in metrics_dict.items():
+                        pl_module.log(metric_name, metric_value, on_epoch=True, sync_dist=True)
+                    
+                    # Print summary
+                    print(f"\n[Epoch {current_epoch}] Test Dataset: {test_name} (threshold={self.threshold})")
+                    print(f"  AUROC: {test_auroc:.4f}, AUPRC: {test_auprc:.4f}")
+                    print(f"  Sensitivity (Recall): {test_recall:.4f}, Specificity: {test_specificity:.4f}")
+                    print(f"  Precision: {test_precision:.4f}, F1: {test_f1:.4f}, MCC: {test_mcc:.4f}")
+                except Exception as e:
+                    print(f"Warning: Could not compute metrics for {test_name}: {e}")
+        
+        # Restore original state
+        pl_module.test_predictions = original_test_predictions
+        pl_module.test_targets = original_test_targets
+        pl_module.test_mhc_names = original_test_mhc_names
+        pl_module.train()
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -279,6 +389,7 @@ def train_fold(config: Dict, fold: int, verbose: bool = True, resume_from_checkp
         max_mhc_length=config['data']['max_mhc_length'],
         use_flanks=config['data']['use_flanks'],
         flank_length=config['data']['flank_length'],
+        flank_mask_prob=config['data'].get('flank_mask_prob', 0.0),
         binarize_labels=True,
         label_threshold=0.5,
     )
@@ -342,6 +453,57 @@ def train_fold(config: Dict, fold: int, verbose: bool = True, resume_from_checkp
     # Create callbacks and loggers
     callbacks = create_callbacks(config, fold)
     loggers = create_logger(config, fold)
+    
+    # Add test-after-epoch callback if test files are specified
+    test_files = config['data'].get('test_files', [])
+    if test_files:
+        from src.data_module import MHCPeptideDataset, mhc_peptide_collate_fn
+        from torch.utils.data import DataLoader
+        
+        test_dataloaders = []
+        test_names = []
+        
+        common_kwargs = {
+            'mhc_seq_path': None,
+            'tokenizer_type': tokenizer_type,
+            'esm_model_name': config['esm']['model_name'],
+            'max_peptide_length': config['data']['max_peptide_length'],
+            'max_mhc_length': config['data']['max_mhc_length'],
+            'use_flanks': config['data']['use_flanks'],
+            'flank_length': config['data']['flank_length'],
+            'flank_mask_prob': 0.0,  # No masking for test
+            'binarize_labels': True,
+            'label_threshold': 0.5,
+        }
+        
+        for test_file in test_files:
+            test_path = Path(test_file)
+            if test_path.exists():
+                test_dataset = MHCPeptideDataset(
+                    data_path=str(test_path),
+                    **common_kwargs
+                )
+                test_dl = DataLoader(
+                    test_dataset,
+                    batch_size=config['training']['batch_size'],
+                    shuffle=False,
+                    num_workers=config['data']['num_workers'],
+                    pin_memory=True,
+                    collate_fn=mhc_peptide_collate_fn
+                )
+                test_dataloaders.append(test_dl)
+                test_names.append(test_path.stem)
+                if verbose:
+                    print(f"  Test dataset '{test_path.stem}': {len(test_dataset):,} samples")
+            else:
+                print(f"Warning: Test file not found: {test_file}")
+        
+        if test_dataloaders:
+            test_callback = TestAfterEpochCallback(test_dataloaders, test_names)
+            callbacks.append(test_callback)
+            if verbose:
+                print(f"  Will evaluate {len(test_dataloaders)} test datasets after each epoch")
+                print()
     
     # Create trainer
     trainer = pl.Trainer(
@@ -447,7 +609,7 @@ def main():
     results = []
     
     if args.train_all_folds:
-        for fold in range(5):
+        for fold in range(3):
             print('ARGS:', args.resume_from_checkpoint)
             result = train_fold(config, fold, args.verbose, args.resume_from_checkpoint)
             results.append(result)

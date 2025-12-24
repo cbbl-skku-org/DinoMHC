@@ -172,6 +172,7 @@ class MHCPeptideDataset(Dataset):
     - Simple embedding tokenization or ESM-2 tokenization
     - Optional flanking sequences
     - Label binarization or continuous labels
+    - Random flank masking for robustness (flank_mask_prob)
     """
     
     def __init__(
@@ -184,6 +185,7 @@ class MHCPeptideDataset(Dataset):
         max_mhc_length: int = 385,  # MHC-I pseudo sequence length + BOS/EOS for ESM
         use_flanks: bool = False,
         flank_length: int = 5,
+        flank_mask_prob: float = 0.0,  # Probability to randomly mask flanks (0.0-1.0)
         binarize_labels: bool = False,
         label_threshold: float = 0.5,
         mhc_column: str = 'mhc',
@@ -200,6 +202,10 @@ class MHCPeptideDataset(Dataset):
             max_mhc_length: Maximum MHC sequence length
             use_flanks: Whether to include flanking sequences
             flank_length: Length of N-terminal and C-terminal flanks
+            flank_mask_prob: Probability to randomly mask flanks with 'X' (0.0-1.0).
+                             When triggered, nflank is masked from left (e.g., XXXAA)
+                             and cflank is masked from right (e.g., AAAXX).
+                             This helps prevent model from biasing towards flank presence.
             binarize_labels: Whether to binarize labels
             label_threshold: Threshold for binarization
             mhc_column: Column name for MHC allele
@@ -212,6 +218,7 @@ class MHCPeptideDataset(Dataset):
         self.max_mhc_length = max_mhc_length
         self.use_flanks = use_flanks
         self.flank_length = flank_length
+        self.flank_mask_prob = flank_mask_prob
         self.binarize_labels = binarize_labels
         self.label_threshold = label_threshold
         
@@ -276,6 +283,8 @@ class MHCPeptideDataset(Dataset):
             - Ensures extended peptide doesn't exceed max_peptide_length + 2*flank_length
             - If the core peptide is too long, flanks may be truncated or removed
             - Priority: core peptide > flanks (since core is essential for binding)
+            - When flank_mask_prob > 0, randomly masks flanks with 'X' characters
+              to prevent model from biasing towards flank presence
         """
         peptide = row[self.peptide_column]
         nflank_len = 0
@@ -289,6 +298,20 @@ class MHCPeptideDataset(Dataset):
             # Take last flank_length of N-flank and first flank_length of C-flank
             nflank = str(nflank)[-self.flank_length:] if pd.notna(nflank) else ''
             cflank = str(cflank)[:self.flank_length] if pd.notna(cflank) else ''
+
+            # Random flank masking for robustness training
+            # This helps the model not bias towards flank presence
+            if self.flank_mask_prob > 0 and np.random.rand() < self.flank_mask_prob:
+                # Randomly choose how many positions to mask (0 to full length)
+                if len(nflank) > 0:
+                    # Mask nflank from left: XXXAA, XXAAA, etc.
+                    n_mask_positions = np.random.randint(0, len(nflank) + 1)
+                    nflank = 'X' * n_mask_positions + nflank[n_mask_positions:]
+                
+                if len(cflank) > 0:
+                    # Mask cflank from right: AAAXX, AAXXX, etc.
+                    c_mask_positions = np.random.randint(0, len(cflank) + 1)
+                    cflank = cflank[:len(cflank) - c_mask_positions] + 'X' * c_mask_positions
 
             # Check if extended sequence would exceed max length
             # max_peptide_length is for core peptide only
@@ -408,6 +431,7 @@ class MHCPeptideDataModule(pl.LightningDataModule):
         max_mhc_length: int = 385,
         use_flanks: bool = False,
         flank_length: int = 5,
+        flank_mask_prob: float = 0.0,  # Probability to randomly mask flanks during training
         binarize_labels: bool = False,
         label_threshold: float = 0.5,
         pin_memory: bool = True,
@@ -426,6 +450,9 @@ class MHCPeptideDataModule(pl.LightningDataModule):
             max_mhc_length: Max MHC sequence length
             use_flanks: Whether to use flanking sequences
             flank_length: Flank length
+            flank_mask_prob: Probability to randomly mask flanks during training (0.0-1.0).
+                             Only applied to training data, not validation/test.
+                             Helps prevent model from biasing towards flank presence.
             binarize_labels: Whether to binarize labels
             label_threshold: Threshold for binarization
             pin_memory: Whether to pin memory for faster GPU transfer
@@ -447,6 +474,7 @@ class MHCPeptideDataModule(pl.LightningDataModule):
         self.max_mhc_length = max_mhc_length
         self.use_flanks = use_flanks
         self.flank_length = flank_length
+        self.flank_mask_prob = flank_mask_prob
         self.binarize_labels = binarize_labels
         self.label_threshold = label_threshold
         self.pin_memory = pin_memory
@@ -480,12 +508,14 @@ class MHCPeptideDataModule(pl.LightningDataModule):
             if train_path.exists():
                 self.train_dataset = MHCPeptideDataset(
                     data_path=str(train_path),
+                    flank_mask_prob=self.flank_mask_prob,  # Only apply to training
                     **common_kwargs
                 )
             
             if val_path.exists():
                 self.val_dataset = MHCPeptideDataset(
                     data_path=str(val_path),
+                    flank_mask_prob=0.0,  # No masking for validation
                     **common_kwargs
                 )
         
@@ -496,6 +526,7 @@ class MHCPeptideDataModule(pl.LightningDataModule):
                 if test_path.exists():
                     self.test_datasets[test_path.stem] = MHCPeptideDataset(
                         data_path=str(test_path),
+                        flank_mask_prob=0.0,  # No masking for test
                         **common_kwargs
                     )
     
