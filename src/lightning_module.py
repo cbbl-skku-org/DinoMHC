@@ -851,14 +851,29 @@ class DinoMHCLightningModule(pl.LightningModule):
                 'name': 'other'
             })
         
-        # AdamW optimizer
-        optimizer = torch.optim.AdamW(
-            param_groups,
-            lr=self.hparams.learning_rate,
-            weight_decay=self.hparams.weight_decay,
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
+        # Initialize optimizer
+        
+        if self.config['training_strategy'].startswith('deepspeed'):
+            try:
+                from deepspeed.ops.adam import FusedAdam
+                optimizer = FusedAdam(
+                    param_groups,
+                    lr=self.hparams.learning_rate,
+                    weight_decay=self.hparams.weight_decay,
+                    betas=(0.9, 0.999),
+                    eps=1e-8,
+                    adam_w_mode=True
+                )
+            except ImportError:
+                raise ImportError("DeepSpeed FusedAdam optimizer not found. Please install DeepSpeed.")
+        else:
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                lr=self.hparams.learning_rate,
+                weight_decay=self.hparams.weight_decay,
+                betas=(0.9, 0.999),
+                eps=1e-8
+            )
         
         # Learning rate scheduler with warmup
         def lr_lambda(current_step: int) -> float:

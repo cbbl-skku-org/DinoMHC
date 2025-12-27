@@ -106,7 +106,7 @@ class HierarchicalGrooveExtractor(nn.Module):
         # Expand region queries for batch
         region_queries = self.region_queries.unsqueeze(0).expand(batch_size, -1, -1)
 
-        # Attend to MHC to identify regions
+        # Attend to MHC to identify regions        
         region_features, region_attn = self.region_attention(
             region_queries, mhc_emb, mhc_emb,
             key_padding_mask=mhc_key_padding_mask,
@@ -136,8 +136,8 @@ class HierarchicalGrooveExtractor(nn.Module):
         if peptide_emb is not None:
             # Proper masked mean pooling
             if peptide_mask is not None:
-                masked_peptide = peptide_emb * peptide_mask.unsqueeze(-1)
-                pep_lengths = peptide_mask.sum(dim=1, keepdim=True).clamp(min=1)
+                masked_peptide = peptide_emb * peptide_mask.unsqueeze(-1).to(peptide_emb.dtype)
+                pep_lengths = peptide_mask.sum(dim=1, keepdim=True).to(peptide_emb.dtype).clamp(min=1)
                 pep_context = masked_peptide.sum(dim=1, keepdim=True) / pep_lengths.unsqueeze(-1)
             else:
                 pep_context = peptide_emb.mean(dim=1, keepdim=True)  # [batch, 1, dim]
@@ -367,7 +367,7 @@ class CrossAttentionWithGeometricBias(nn.Module):
         
         # Apply attention mask if provided
         if attention_mask is not None:
-            attn_scores = attn_scores.masked_fill(attention_mask.float() == 0, float('-inf'))
+            attn_scores = attn_scores.masked_fill(attention_mask == 0, float('-inf'))
         
         # Softmax and dropout
         attn_weights = F.softmax(attn_scores, dim=-1)
@@ -539,9 +539,9 @@ class GroovePeptideFusionLayer(nn.Module):
         
         # Zero out padded positions in output
         if peptide_mask is not None:
-            peptide_emb = peptide_emb * peptide_mask.unsqueeze(-1).float()
+            peptide_emb = peptide_emb * peptide_mask.unsqueeze(-1).to(peptide_emb.dtype)
         if groove_mask is not None:
-            groove_emb = groove_emb * groove_mask.unsqueeze(-1).float()
+            groove_emb = groove_emb * groove_mask.unsqueeze(-1).to(groove_emb.dtype)
         
         if return_attention:
             attention_info = {
@@ -635,9 +635,9 @@ class GroovePeptideFusion(nn.Module):
         
         # Ensure padded positions stay zeroed after final norm
         if peptide_mask is not None:
-            peptide_fused = peptide_fused * peptide_mask.unsqueeze(-1).float()
+            peptide_fused = peptide_fused * peptide_mask.unsqueeze(-1).to(peptide_fused.dtype)
         if groove_mask is not None:
-            groove_fused = groove_fused * groove_mask.unsqueeze(-1).float()
+            groove_fused = groove_fused * groove_mask.unsqueeze(-1).to(groove_fused.dtype)
         
         return peptide_fused, groove_fused, all_attention
 # END============================================================================
@@ -1246,7 +1246,7 @@ def apply_pair_mask(pair_rep: torch.Tensor, pair_mask: torch.Tensor) -> torch.Te
     Returns:
         Masked pair representation
     """
-    return pair_rep * pair_mask.unsqueeze(-1).float()
+    return pair_rep * pair_mask.unsqueeze(-1).to(pair_rep.dtype)
 
 class TriangleAttention(nn.Module):
     """
@@ -1437,7 +1437,7 @@ class TriangleMultiplication(nn.Module):
         
         # Zero out padding before einsum to prevent them from contributing
         if pair_mask is not None:
-            mask_expanded = pair_mask.unsqueeze(-1).float()
+            mask_expanded = pair_mask.unsqueeze(-1).to(left.dtype)
             left = left * mask_expanded
             right = right * mask_expanded
         
@@ -1787,8 +1787,8 @@ class InterfaceGeometryModule(nn.Module):
         # =====================================================================
         # Step 2: Zero out padding in input embeddings BEFORE concatenation
         # =====================================================================
-        peptide_emb_masked = peptide_emb * peptide_mask.unsqueeze(-1).float()
-        groove_emb_masked = groove_emb * groove_mask.unsqueeze(-1).float()
+        peptide_emb_masked = peptide_emb * peptide_mask.unsqueeze(-1).to(peptide_emb.dtype)
+        groove_emb_masked = groove_emb * groove_mask.unsqueeze(-1).to(groove_emb.dtype)
         
         # =====================================================================
         # Step 3: Concatenate sequences
@@ -1844,10 +1844,11 @@ class InterfaceGeometryModule(nn.Module):
         # Step 9: Pool interface representation
         # =====================================================================
         # Masked mean pooling - only over valid positions
-        interface_mask_expanded = interface_mask.unsqueeze(-1).float()
-        
+        interface_mask_expanded = interface_mask.unsqueeze(-1).to(interface_pair_rep.dtype)
+
         interface_sum = (interface_pair_rep * interface_mask_expanded).sum(dim=[1, 2])
-        interface_count = interface_mask.sum(dim=[1, 2], keepdim=False).float().clamp(min=1)
+        # Convert count to match interface_sum dtype to preserve bfloat16/float16
+        interface_count = interface_mask.sum(dim=[1, 2], keepdim=False).to(interface_sum.dtype).clamp(min=1)
         interface_rep = interface_sum / interface_count.unsqueeze(-1)
         # [batch, dim]
         
@@ -1976,8 +1977,8 @@ class PositionAwarePeptideEncoder(nn.Module):
         
         # Zero out padded positions
         if peptide_mask is not None:
-            enhanced_emb = enhanced_emb * peptide_mask.unsqueeze(-1).float()
-            importance = importance * peptide_mask.unsqueeze(-1).float()
+            enhanced_emb = enhanced_emb * peptide_mask.unsqueeze(-1).to(enhanced_emb.dtype)
+            importance = importance * peptide_mask.unsqueeze(-1).to(importance.dtype)
         
         if return_importance:
             return enhanced_emb, importance.squeeze(-1)
@@ -2120,7 +2121,7 @@ class EmbeddingEncoder(nn.Module):
         
         # Zero out padded positions
         if mask is not None:
-            x = x * mask.unsqueeze(-1).float()
+            x = x * mask.unsqueeze(-1).to(x.dtype)
         
         return x
 
@@ -2664,7 +2665,8 @@ class ESM2Encoder(nn.Module):
             mask_stripped = mask_no_eos[:, 1:]
             
             # Apply mask to zero out EOS and PAD positions
-            x = x * mask_stripped.unsqueeze(-1).float()
+            # Use x.dtype to preserve the dtype (bfloat16/float16/float32)
+            x = x * mask_stripped.unsqueeze(-1).to(x.dtype)
         
         return x
             
@@ -2822,6 +2824,12 @@ class DinoMHC(nn.Module):
             # Different encoders allow specialized fine-tuning
             self.peptide_encoder = ESM2Encoder(**esm_kwargs)
             self.mhc_encoder = ESM2Encoder(**esm_kwargs)
+            
+            # Freeze mhc encoder
+            for param in self.mhc_encoder.parameters():
+                param.requires_grad = False
+            self.mhc_encoder.eval()
+            
             self.shared_encoder = False
             # Store EOS index for mask adjustment
             self._esm_eos_idx = self.peptide_encoder.alphabet.eos_idx
@@ -2913,6 +2921,7 @@ class DinoMHC(nn.Module):
             - Output: [seq..., (EOS zeroed), (PAD zeroed)]
             - BOS is removed (position 0), EOS is zeroed via mask
         """
+        
         peptide_emb = self.peptide_encoder(peptide_tokens, mask=peptide_mask)
         mhc_emb = self.mhc_encoder(mhc_tokens, mask=mhc_mask)
         
@@ -3083,7 +3092,7 @@ class DinoMHC(nn.Module):
             peptide_tokens, mhc_tokens,
             peptide_mask=peptide_mask, mhc_mask=mhc_mask
         )
-
+        
         # === Step 2: Extract groove from MHC ===
         # Note: groove_emb has fixed size (num_groove_tokens), so no mask needed for it
         groove_emb, groove_attn = self.groove_extractor(
