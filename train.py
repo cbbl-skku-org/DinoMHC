@@ -279,6 +279,8 @@ def get_model_config(config: Dict) -> Dict[str, Any]:
         'esm_lora_alpha': config['esm'].get('lora_alpha', 16),
         'esm_lora_dropout': config['esm'].get('lora_dropout', 0.1),
         'esm_lora_target_modules': config['esm'].get('lora_target_modules', None),
+        # Training Strategy
+        'training_strategy': config['hardware'].get('strategy', 'auto'),
     }
     return model_config
 
@@ -433,6 +435,8 @@ def train_fold(config: Dict, fold: int, verbose: bool = True, resume_from_checkp
         **module_kwargs
     )
     
+    # model = torch.compile(model, dynamic=True)
+    
     if verbose:
         # Print model info
         print("Model Configuration:")
@@ -506,6 +510,7 @@ def train_fold(config: Dict, fold: int, verbose: bool = True, resume_from_checkp
                 print()
     
     # Create trainer
+    
     trainer = pl.Trainer(
         max_epochs=config['training']['max_epochs'],
         max_steps=max_steps_cfg if max_steps_cfg > 0 else -1,
