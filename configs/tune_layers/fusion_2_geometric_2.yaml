@@ -31,7 +31,7 @@ model:
 # ESM-2 Encoder Configuration (only used if encoder_type is esm2 or esm2_shared)
 esm:
   model_name: facebook/esm2_t30_150M_UR50D
-  unfreeze_layers: 3
+  unfreeze_layers: 6
   unfreeze_embeddings: false
   # Quantization: null, '4bit', or '8bit' (requires bitsandbytes)
   quantization: null
@@ -44,14 +44,14 @@ esm:
 
 # Training Configuration
 training:
-  batch_size: 32
+  batch_size: 58
   learning_rate: 0.001
   weight_decay: 0.0006
   encoder_lr_factor: 0.1
   warmup_steps: 1500
   max_epochs: 20
   max_steps: -1  # -1 for no limit
-  accumulate_grad_batches: 16
+  accumulate_grad_batches: 9
   gradient_clip_val: 1.0
   precision: "bf16-mixed"  # 32, 16-mixed, bf16-mixed
 
@@ -76,17 +76,17 @@ loss:
 # Callbacks Configuration
 callbacks:
   patience: 3
-  save_top_k: 1
+  save_top_k: 3
 
 # Hardware Configuration
 hardware:
   gpus: 8
-  strategy: 'ddp_find_unused_parameters_true'
+  strategy: 'deepspeed_stage_2'
 
 # Logging Configuration
 logging:
   experiment_name: dinomhc_fusion_2_geometric_2
-  output_dir: /data/balalab/dinomhc/tune_num_layers/dinomhc_fusion_2_geometric_2
+  output_dir: /data/balalab/dinomhc/tune_num_layers_use_lora_unshared_encoder_freeze_MHC_branch/dinomhc_fusion_2_geometric_2
   use_wandb: false
   wandb_project: dinomhc_fusion_2_geometric_2
   wandb_entity: null
