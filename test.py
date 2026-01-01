@@ -246,7 +246,7 @@ def test_benchmark(
         max_mhc_length=config['data']['max_mhc_length'],
         use_flanks=config['data']['use_flanks'],
         flank_length=config['data']['flank_length'],
-        flank_mask_prob=config['data']['flank_mask_prob'],
+        flank_mask_prob=0.0,
         binarize_labels=True,
         label_threshold=0.5,
         test_files=test_files,
@@ -268,18 +268,21 @@ def test_benchmark(
         print("Loading model from checkpoint...")
 
     # Determine which module class to use based on checkpoint
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    
     model_config = {'config': get_model_config(config)}
-    
+
     model = create_lightning_module(
         # config=config['model'],
         use_allele_balanced_loss=config['loss'].get('use_allele_balanced_loss', False),
         **model_config
     )
+
+    state_dict = torch.load(checkpoint_path, map_location=device)
+
+    model.load_state_dict(state_dict, strict=True)
+    # model = model.to(torch.bfloat16)
+    model = model.to(torch.bfloat16)
     
-    model.load_state_dict(ckpt['state_dict'], strict=True)
-    model.to(device)
+    model.eval()
 
     if verbose:
         print(f"Model loaded successfully!")
@@ -314,7 +317,7 @@ def test_benchmark(
         callbacks=callbacks,
         enable_progress_bar=verbose,
         enable_model_summary=False,
-        logger=False,
+        logger=False
     )
 
     # Run testing
@@ -441,7 +444,7 @@ def main():
     if config_path is None:
         if args.verbose:
             print("Config not provided, trying to infer from checkpoint directory...")
-        config_path = infer_config_from_checkpoint(args.checkpoint)
+        config_path = infer_config_from_checkpoint  (args.checkpoint)
         if config_path is None:
             print("Error: Could not find config.yaml. Please provide --config explicitly.")
             sys.exit(1)
