@@ -3,6 +3,8 @@ datasets/
 calculate_metrics*
 *_results
 exp_*
+bash*
+*.sh
 
 # Ckpts and logs
 outputs/
