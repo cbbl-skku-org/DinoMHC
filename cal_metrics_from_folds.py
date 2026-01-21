@@ -2,6 +2,7 @@ import pandas as pd
 from argparse import ArgumentParser
 from sklearn.metrics import roc_auc_score, average_precision_score, confusion_matrix
 import math
+import os
 
 def calculate_metrics(df, score_col='score_avg', threshold=0.5):
     # Calculate Sensitivity, Specificity, Precision, F1 Score, MCC, AUROC, AUPRC
@@ -61,9 +62,15 @@ def main(args):
 
     combined['score_avg'] = combined[[f'score_{i}' for i in range(len(dfs))]].mean(axis=1)
     
+    # Check if output folder path exists, if not create it
+    os.makedirs(args.output_folder_path, exist_ok=True)
+    
     # Special case, if users want to group by peptide_len
     if args.groupby_cols and 'peptide_len' in args.groupby_cols:
         combined['peptide_len'] = combined['peptide'].str.len()
+        
+    # Save combined dataframe
+    combined.to_csv(os.path.join(args.output_folder_path, "predictions.tsv"), sep='\t', index=False)
     
     if args.groupby_cols:
         grouped = combined.groupby(by=args.groupby_cols)
@@ -84,11 +91,11 @@ def main(args):
         avg_metrics.name = 'Average'
         metrics_df = pd.concat([metrics_df, pd.DataFrame([avg_metrics])])
         
-        metrics_df.to_csv(args.output_path, sep='\t')
+        metrics_df.to_csv(os.path.join(args.output_folder_path, "metrics.tsv"), sep='\t')
     else:
         metrics = calculate_metrics(combined, score_col='score_avg', threshold=0.5)
         metrics_df = pd.DataFrame([metrics])
-        metrics_df.to_csv(args.output_path, sep='\t', index=False)
+        metrics_df.to_csv(os.path.join(args.output_folder_path, "metrics.tsv"), sep='\t', index=False)
 
 if __name__ == "__main__":
     
@@ -96,7 +103,7 @@ if __name__ == "__main__":
     
     parser.add_argument("--paths", nargs='+', required=True, help="Paths to the input TSV files")
     parser.add_argument("--groupby_cols", nargs='+', help="Calculate metrics in each group then averaging", default=None)
-    parser.add_argument("--output_path", type=str, help="Path to save the output TSV file", default="output.tsv")
+    parser.add_argument("--output_folder_path", type=str, help="Path to save the output TSV file", default="./output")
     
     args = parser.parse_args()
     
