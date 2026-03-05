@@ -4,6 +4,8 @@ calculate_metrics*
 *_results
 exp_*
 
+tune_*/
+
 # Ckpts and logs
 outputs/
 
