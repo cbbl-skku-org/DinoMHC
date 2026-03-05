@@ -29,7 +29,7 @@ from torchmetrics import (
     MatthewsCorrCoef
 )
 
-from .model import DinoMHC
+from .model import DinoMHC, DinoMHC_ProtTrans
 
 
 def find_optimal_threshold_pr(
@@ -283,8 +283,13 @@ class DinoMHCLightningModule(pl.LightningModule):
         # Store config separately
         self.config = config or {}
         print(self.config)
-        # Build model
-        self.model = DinoMHC(config)
+        # Build model based on encoder_type
+        encoder_type = self.config.get('encoder_type', 'esm2')
+        prottrans_types = ('protbert', 'protbert_shared', 'prott5', 'prott5_shared', 'protxlnet', 'protxlnet_shared')
+        if encoder_type in prottrans_types:
+            self.model = DinoMHC_ProtTrans(config)
+        else:
+            self.model = DinoMHC(config)
         
         # Task type from config
         self.task_type = self.config.get('task_head', 'presentation')
@@ -829,7 +834,10 @@ class DinoMHCLightningModule(pl.LightningModule):
                 continue
                 
             # Check if this is an encoder parameter
-            if 'peptide_encoder' in name or 'mhc_encoder' in name or 'shared_esm_encoder' in name:
+            if any(enc_name in name for enc_name in (
+                'peptide_encoder', 'mhc_encoder', 
+                'shared_esm_encoder', 'shared_prottrans_encoder'
+            )):
                 encoder_params.append(param)
             else:
                 other_params.append(param)

@@ -269,16 +269,26 @@ def get_model_config(config: Dict) -> Dict[str, Any]:
         'use_flanks': config['data']['use_flanks'],
         'flank_pooling': config['model']['flank_pooling'],
         'encoder_type': config['model']['encoder_type'],
+        # ESM configuration
         'esm_model_name': config['esm']['model_name'],
         'esm_unfreeze_layers': config['esm']['unfreeze_layers'],
         'esm_unfreeze_embeddings': config['esm']['unfreeze_embeddings'],
-        # Quantization and LoRA options
         'esm_quantization': config['esm'].get('quantization', None),
         'esm_use_lora': config['esm'].get('use_lora', False),
         'esm_lora_r': config['esm'].get('lora_r', 8),
         'esm_lora_alpha': config['esm'].get('lora_alpha', 16),
         'esm_lora_dropout': config['esm'].get('lora_dropout', 0.1),
         'esm_lora_target_modules': config['esm'].get('lora_target_modules', None),
+        # ProtTrans configuration
+        'prottrans_model_name': config.get('prottrans', {}).get('model_name', 'Rostlab/prot_bert'),
+        'prottrans_unfreeze_layers': config.get('prottrans', {}).get('unfreeze_layers', 2),
+        'prottrans_unfreeze_embeddings': config.get('prottrans', {}).get('unfreeze_embeddings', False),
+        'prottrans_quantization': config.get('prottrans', {}).get('quantization', None),
+        'prottrans_use_lora': config.get('prottrans', {}).get('use_lora', False),
+        'prottrans_lora_r': config.get('prottrans', {}).get('lora_r', 8),
+        'prottrans_lora_alpha': config.get('prottrans', {}).get('lora_alpha', 16),
+        'prottrans_lora_dropout': config.get('prottrans', {}).get('lora_dropout', 0.1),
+        'prottrans_lora_target_modules': config.get('prottrans', {}).get('lora_target_modules', None),
         # Training Strategy
         'training_strategy': config['hardware'].get('strategy', 'auto'),
     }
@@ -308,7 +318,7 @@ def create_callbacks(config: Dict, fold: int) -> list:
         monitor="val/auprc",
         mode="max",
         patience=config['callbacks']['patience'],
-        min_delta=0.001,
+        min_delta=0.005,
         verbose=True,
     )
     callbacks.append(early_stopping)
@@ -378,7 +388,14 @@ def train_fold(config: Dict, fold: int, verbose: bool = True, resume_from_checkp
     
     # Create data module
     encoder_type = config['model']['encoder_type']
-    tokenizer_type = 'esm2' if encoder_type in ['esm2', 'esm2_shared'] else 'embedding'
+    prottrans_types = ('protbert', 'protbert_shared', 'prott5', 'prott5_shared', 'protxlnet', 'protxlnet_shared')
+    
+    if encoder_type in ('esm2', 'esm2_shared'):
+        tokenizer_type = 'esm2'
+    elif encoder_type in prottrans_types:
+        tokenizer_type = 'prottrans'
+    else:
+        tokenizer_type = 'embedding'
     
     data_module = MHCPeptideDataModule(
         data_dir=config['data']['data_dir'],
@@ -387,6 +404,7 @@ def train_fold(config: Dict, fold: int, verbose: bool = True, resume_from_checkp
         num_workers=config['data']['num_workers'],
         tokenizer_type=tokenizer_type,
         esm_model_name=config['esm']['model_name'],
+        prottrans_model_name=config.get('prottrans', {}).get('model_name', 'Rostlab/prot_bert'),
         max_peptide_length=config['data']['max_peptide_length'],
         max_mhc_length=config['data']['max_mhc_length'],
         use_flanks=config['data']['use_flanks'],
@@ -471,6 +489,7 @@ def train_fold(config: Dict, fold: int, verbose: bool = True, resume_from_checkp
             'mhc_seq_path': None,
             'tokenizer_type': tokenizer_type,
             'esm_model_name': config['esm']['model_name'],
+            'prottrans_model_name': config.get('prottrans', {}).get('model_name', 'Rostlab/prot_bert'),
             'max_peptide_length': config['data']['max_peptide_length'],
             'max_mhc_length': config['data']['max_mhc_length'],
             'use_flanks': config['data']['use_flanks'],
@@ -587,6 +606,12 @@ def main():
     print(f"\nConfig file: {args.config}")
     print(f"Experiment: {config['logging']['experiment_name']}")
     print(f"Encoder type: {config['model']['encoder_type']}")
+    encoder_type = config['model']['encoder_type']
+    prottrans_types = ('protbert', 'protbert_shared', 'prott5', 'prott5_shared', 'protxlnet', 'protxlnet_shared')
+    if encoder_type in prottrans_types:
+        print(f"ProtTrans model: {config.get('prottrans', {}).get('model_name', 'Rostlab/prot_bert')}")
+    elif encoder_type in ('esm2', 'esm2_shared'):
+        print(f"ESM model: {config['esm']['model_name']}")
     print(f"Batch size: {config['training']['batch_size']}")
     print(f"Learning rate: {config['training']['learning_rate']}")
     print(f"Max epochs: {config['training']['max_epochs']}")

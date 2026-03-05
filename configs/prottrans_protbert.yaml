@@ -1,0 +1,100 @@
+# DinoMHC ProtTrans Configuration — ProtBERT (shared encoder)
+# =============================================================
+# Uses Rostlab/prot_bert as the protein language model encoder.
+# To switch models, change model.encoder_type and prottrans.model_name:
+#
+#   ProtBERT:  encoder_type: protbert_shared,  model_name: Rostlab/prot_bert
+#   ProtT5:    encoder_type: prott5_shared,    model_name: Rostlab/prot_t5_xl_uniref50
+#   ProtXLNet: encoder_type: protxlnet_shared, model_name: Rostlab/prot_xlnet
+#
+# For separate peptide/MHC encoders, drop the "_shared" suffix.
+# =============================================================
+
+# Data Configuration
+data:
+  data_dir: datasets/el/folds
+  num_workers: 16
+  use_flanks: false
+  flank_length: 5
+  flank_mask_prob: 0.0
+  max_peptide_length: 15
+  max_mhc_length: 385
+
+# Model Configuration
+model:
+  encoder_type: protxlnet  # protbert, protbert_shared, prott5, prott5_shared, protxlnet, protxlnet_shared, embedding
+  dim: 128
+  num_groove_tokens: 60
+  num_fusion_layers: 1
+  num_geometry_blocks: 1
+  num_heads: 8
+  dropout: 0.1
+  task_head: presentation
+  flank_pooling: mean
+
+# ESM-2 Encoder Configuration (not used for ProtTrans, but kept for compatibility)
+esm:
+  model_name: facebook/esm2_t6_8M_UR50D
+  unfreeze_layers: 2
+  unfreeze_embeddings: false
+
+# ProtTrans Encoder Configuration
+prottrans:
+  model_name: Rostlab/prot_xlnet
+  unfreeze_layers: 6
+  unfreeze_embeddings: false
+  # Quantization: null, '4bit', '8bit'
+  quantization: null
+  # LoRA options
+  use_lora: false
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_target_modules: null  # null = auto-detected per model family
+
+# Training Configuration
+training:
+  batch_size: 4
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  encoder_lr_factor: 0.1
+  warmup_steps: 1000
+  max_epochs: 50
+  max_steps: -1
+  accumulate_grad_batches: 32
+  gradient_clip_val: 1.0
+  precision: bf16-mixed
+
+# Loss Configuration
+loss:
+  use_allele_balanced_loss: true
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  allele_weight_type: inverse_freq
+  allele_beta: 0.9999
+  normalize_allele_weights: true
+  pos_weight: null
+  label_smoothing: 0.0
+
+# Callbacks Configuration
+callbacks:
+  patience: 10
+  save_top_k: 3
+
+# Hardware Configuration
+hardware:
+  gpus: 4
+  strategy: "deepspeed_stage_2"
+
+# Logging Configuration
+logging:
+  experiment_name: dinomhc_protxlnet
+  output_dir: outputs
+  use_wandb: false
+  wandb_project: dinomhc
+  wandb_entity: null
+
+# Miscellaneous
+misc:
+  seed: 42
+  debug: false

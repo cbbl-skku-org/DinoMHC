@@ -2669,6 +2669,633 @@ class ESM2Encoder(nn.Module):
             x = x * mask_stripped.unsqueeze(-1).to(x.dtype)
         
         return x
+
+
+class ProtTransEncoder(nn.Module):
+    """
+    ProtTrans family encoder using Hugging Face Transformers.
+    
+    Supports:
+    - ProtBERT (BERT-based, encoder-only)
+    - ProtT5 (T5-based, encoder-decoder; uses encoder only)
+    - ProtXLNet (XLNet-based, permutation language model)
+    - Freezing/unfreezing specific layers for fine-tuning
+    - Projection to match model dimension
+    - Quantization (4-bit/8-bit) using bitsandbytes
+    - LoRA (Low-Rank Adaptation) using PEFT
+    
+    Model options:
+    - "Rostlab/prot_bert"             (ProtBERT, 30 layers, ~420M params)
+    - "Rostlab/prot_bert_bfd"         (ProtBERT-BFD, 30 layers, ~420M params)
+    - "Rostlab/prot_t5_xl_uniref50"   (ProtT5-XL-UniRef50, encoder ~1.2B params)
+    - "Rostlab/prot_t5_xl_bfd"        (ProtT5-XL-BFD, encoder ~1.2B params)
+    - "Rostlab/prot_t5_xxl_uniref50"  (ProtT5-XXL-UniRef50, encoder ~5.6B params)
+    - "Rostlab/prot_t5_xxl_bfd"       (ProtT5-XXL-BFD, encoder ~5.6B params)
+    - "Rostlab/prot_xlnet"            (ProtXLNet, 12 layers, ~409M params)
+    
+    IMPORTANT - ProtTrans tokenization:
+    - ProtTrans models expect sequences with SPACES between amino acids, e.g. "M A K L ..."
+    - The tokenizer handles special tokens (CLS/SEP/EOS) automatically.
+    - For ProtBERT: [CLS] M A K L ... [SEP] [PAD]
+    - For ProtT5: M A K L ... </s> <pad>
+    - For ProtXLNet: M A K L ... <sep> <cls> <pad>
+    
+    Common strategies:
+    - Freeze all: unfreeze_layers=0 (feature extraction)
+    - Unfreeze last N: unfreeze_layers=N (fine-tuning)
+    - Unfreeze all: unfreeze_layers=-1 (full fine-tuning)
+    
+    Quantization options:
+    - quantization=None: No quantization (default)
+    - quantization='4bit': 4-bit quantization (NF4)
+    - quantization='8bit': 8-bit quantization
+    
+    LoRA options:
+    - use_lora=False: No LoRA (default)
+    - use_lora=True: Apply LoRA to attention layers
+    - lora_r: LoRA rank (default: 8)
+    - lora_alpha: LoRA alpha scaling (default: 16)
+    - lora_dropout: LoRA dropout (default: 0.1)
+    - lora_target_modules: Modules to apply LoRA (auto-detected per model family)
+    """
+    
+    # Mapping of model family to architecture type
+    _MODEL_FAMILIES = {
+        'prot_bert': 'bert',
+        'prot_t5': 't5',
+        'prot_xlnet': 'xlnet',
+    }
+    
+    def __init__(
+        self,
+        output_dim: int,
+        model_name: str = "Rostlab/prot_bert",
+        unfreeze_layers: int = 2,
+        unfreeze_embeddings: bool = False,
+        # Quantization options
+        quantization: Optional[str] = None,  # None, '4bit', '8bit'
+        # LoRA options
+        use_lora: bool = False,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.1,
+        lora_target_modules: Optional[list] = None,
+    ):
+        super().__init__()
+        self.output_dim = output_dim
+        self.unfreeze_layers = unfreeze_layers
+        self.unfreeze_embeddings = unfreeze_embeddings
+        self.quantization = quantization
+        self.use_lora = use_lora
+        self.model_name = model_name
+        
+        # Detect model family
+        self.model_family = self._detect_model_family(model_name)
+        
+        # Load model and tokenizer
+        try:
+            self._load_model_and_tokenizer(model_name, quantization)
+        except ImportError:
+            raise ImportError(
+                "Transformers package not found. Install with: pip install transformers"
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to load ProtTrans model '{model_name}': {e}")
+        
+        # Apply LoRA if requested
+        if use_lora:
+            self._apply_lora(
+                lora_r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                lora_target_modules=lora_target_modules,
+            )
+        
+        # Projection layer if dimensions don't match
+        if self.model_dim != output_dim:
+            self.proj = nn.Linear(self.model_dim, output_dim)
+        else:
+            self.proj = nn.Identity()
+        
+        self.norm = LayerNorm(output_dim)
+        
+        # Apply freezing strategy (skip if using LoRA - LoRA handles this)
+        if not use_lora:
+            self._apply_freeze_strategy()
+        
+        # Create a fake alphabet object for compatibility with existing code
+        self._create_alphabet_compat()
+    
+    @staticmethod
+    def _detect_model_family(model_name: str) -> str:
+        """Detect the ProtTrans model family from model name."""
+        model_name_lower = model_name.lower()
+        if 'prot_t5' in model_name_lower or 'prott5' in model_name_lower:
+            return 't5'
+        elif 'prot_xlnet' in model_name_lower or 'protxlnet' in model_name_lower:
+            return 'xlnet'
+        elif 'prot_bert' in model_name_lower or 'protbert' in model_name_lower:
+            return 'bert'
+        else:
+            raise ValueError(
+                f"Cannot detect model family from '{model_name}'. "
+                "Expected model name containing 'prot_bert', 'prot_t5', or 'prot_xlnet'."
+            )
+    
+    def _load_model_and_tokenizer(self, model_name: str, quantization: Optional[str]):
+        """Load the appropriate model and tokenizer based on model family."""
+        # Setup quantization config
+        quantization_config = self._build_quantization_config(quantization)
+        
+        load_kwargs = {}
+        if quantization_config is not None:
+            load_kwargs['quantization_config'] = quantization_config
+            load_kwargs['device_map'] = 'auto'
+            load_kwargs['torch_dtype'] = torch.bfloat16
+        
+        if self.model_family == 'bert':
+            self._load_bert(model_name, load_kwargs)
+        elif self.model_family == 't5':
+            self._load_t5(model_name, load_kwargs)
+        elif self.model_family == 'xlnet':
+            self._load_xlnet(model_name, load_kwargs)
+    
+    def _load_bert(self, model_name: str, load_kwargs: dict):
+        """Load ProtBERT model."""
+        from transformers import BertModel, BertTokenizer
+        
+        self.model = BertModel.from_pretrained(model_name, **load_kwargs)
+        self.tokenizer = BertTokenizer.from_pretrained(model_name, do_lower_case=False)
+        
+        self.model_dim = self.model.config.hidden_size
+        self.num_layers = self.model.config.num_hidden_layers
+        self.padding_idx = self.tokenizer.pad_token_id
+        
+        # Special tokens
+        self.bos_idx = self.tokenizer.cls_token_id  # [CLS]
+        self.eos_idx = self.tokenizer.sep_token_id  # [SEP]
+    
+    def _load_t5(self, model_name: str, load_kwargs: dict):
+        """Load ProtT5 model (encoder only)."""
+        from transformers import T5EncoderModel, T5Tokenizer
+        
+        self.model = T5EncoderModel.from_pretrained(model_name, **load_kwargs)
+        self.tokenizer = T5Tokenizer.from_pretrained(model_name, do_lower_case=False)
+        
+        self.model_dim = self.model.config.d_model
+        self.num_layers = self.model.config.num_layers
+        self.padding_idx = self.tokenizer.pad_token_id
+        
+        # T5 special tokens
+        self.bos_idx = None  # T5 has no CLS/BOS token
+        self.eos_idx = self.tokenizer.eos_token_id  # </s>
+    
+    def _load_xlnet(self, model_name: str, load_kwargs: dict):
+        """Load ProtXLNet model."""
+        from transformers import XLNetModel, XLNetTokenizer
+        
+        self.model = XLNetModel.from_pretrained(model_name, **load_kwargs)
+        self.tokenizer = XLNetTokenizer.from_pretrained(model_name, do_lower_case=False)
+        
+        self.model_dim = self.model.config.d_model
+        self.num_layers = self.model.config.n_layer
+        self.padding_idx = self.tokenizer.pad_token_id
+        
+        # XLNet special tokens: sequence ends with <sep> <cls>
+        self.bos_idx = None  # XLNet puts CLS at end, not beginning
+        self.eos_idx = self.tokenizer.sep_token_id  # <sep>
+        self._xlnet_cls_idx = self.tokenizer.cls_token_id  # <cls> (at end)
+    
+    def _build_quantization_config(self, quantization: Optional[str]):
+        """Build quantization config for bitsandbytes."""
+        if quantization is None:
+            return None
+        
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"Quantization '{quantization}' requires CUDA but no GPU is available. "
+                "Set quantization=None to use CPU."
+            )
+        
+        try:
+            from transformers import BitsAndBytesConfig
+            import bitsandbytes as bnb  # noqa: F401
+            
+            if quantization == '4bit':
+                return BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                )
+            elif quantization == '8bit':
+                return BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_skip_modules=["lm_head"],
+                )
+            else:
+                raise ValueError(
+                    f"Unknown quantization type: {quantization}. Use '4bit' or '8bit'."
+                )
+        except ImportError as e:
+            raise ImportError(
+                f"bitsandbytes package not found or error importing: {e}. "
+                "Install with: pip install bitsandbytes>=0.41.0"
+            )
+    
+    def _apply_lora(
+        self,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.1,
+        lora_target_modules: Optional[list] = None,
+    ):
+        """Apply LoRA to the model using PEFT."""
+        try:
+            from peft import LoraConfig, get_peft_model, TaskType
+            
+            # Auto-detect target modules per model family
+            if lora_target_modules is None:
+                lora_target_modules = self._get_default_lora_targets()
+            
+            lora_config = LoraConfig(
+                task_type=TaskType.FEATURE_EXTRACTION,
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=lora_target_modules,
+                bias="none",
+            )
+            
+            self.model = get_peft_model(self.model, lora_config)
+            self.model.print_trainable_parameters()
+            
+        except ImportError:
+            raise ImportError(
+                "PEFT package not found for LoRA. Install with: pip install peft"
+            )
+    
+    def _get_default_lora_targets(self) -> list:
+        """Get default LoRA target modules for each model family."""
+        if self.model_family == 'bert':
+            # ProtBERT uses standard BERT attention: query, key, value
+            return ["query", "key", "value"]
+        elif self.model_family == 't5':
+            # ProtT5 uses T5 attention: q, k, v, o projections
+            return ["q", "k", "v", "o"]
+        elif self.model_family == 'xlnet':
+            # ProtXLNet attention uses nn.Parameter (not nn.Linear) for q, k, v, o
+            # so LoRA cannot target them. Use FFN layers instead.
+            return ["layer_1", "layer_2"]
+        else:
+            return ["query", "key", "value"]
+    
+    def _create_alphabet_compat(self):
+        """Create a compatibility layer for code expecting fair-esm alphabet."""
+        model_family = self.model_family
+        
+        class AlphabetCompat:
+            def __init__(self, tokenizer, family):
+                self.tokenizer = tokenizer
+                self.family = family
+                self.padding_idx = tokenizer.pad_token_id
+                
+                # Map to ESM-compatible token IDs
+                if family == 'bert':
+                    self.cls_idx = tokenizer.cls_token_id
+                    self.eos_idx = tokenizer.sep_token_id
+                elif family == 't5':
+                    self.cls_idx = None  # T5 has no CLS
+                    self.eos_idx = tokenizer.eos_token_id
+                elif family == 'xlnet':
+                    self.cls_idx = tokenizer.cls_token_id
+                    self.eos_idx = tokenizer.sep_token_id
+                
+                self.mask_idx = getattr(tokenizer, 'mask_token_id', None)
+            
+            def get_tok(self, idx):
+                return self.tokenizer.convert_ids_to_tokens(idx)
+            
+            def get_batch_converter(self):
+                """Return a batch converter function compatible with fair-esm."""
+                tokenizer = self.tokenizer
+                family = self.family
+                
+                def batch_converter(data):
+                    # data is list of (label, sequence) tuples
+                    labels = [d[0] for d in data]
+                    sequences = [d[1] for d in data]
+                    
+                    # ProtTrans expects spaces between amino acids
+                    spaced_sequences = [" ".join(list(seq)) for seq in sequences]
+                    
+                    encoded = tokenizer(
+                        spaced_sequences,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        add_special_tokens=True,
+                    )
+                    
+                    return labels, sequences, encoded['input_ids']
+                
+                return batch_converter
+        
+        self.alphabet = AlphabetCompat(self.tokenizer, model_family)
+    
+    def _apply_freeze_strategy(self):
+        """Apply layer freezing based on configuration."""
+        # First, freeze everything
+        for param in self.model.parameters():
+            param.requires_grad = False
+        
+        if self.unfreeze_layers == -1:
+            # Unfreeze all layers
+            for param in self.model.parameters():
+                param.requires_grad = True
+        elif self.unfreeze_layers > 0:
+            layers_to_unfreeze = list(range(
+                self.num_layers - self.unfreeze_layers,
+                self.num_layers
+            ))
+            
+            if self.model_family == 'bert':
+                # BertModel: model.encoder.layer[i]
+                for layer_idx in layers_to_unfreeze:
+                    if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'layer'):
+                        for param in self.model.encoder.layer[layer_idx].parameters():
+                            param.requires_grad = True
+                # Final layer norm (BERT has it inside pooler, but also LayerNorm)
+                if hasattr(self.model, 'pooler') and self.model.pooler is not None:
+                    for param in self.model.pooler.parameters():
+                        param.requires_grad = True
+                        
+            elif self.model_family == 't5':
+                # T5EncoderModel: model.encoder.block[i]
+                for layer_idx in layers_to_unfreeze:
+                    if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'block'):
+                        for param in self.model.encoder.block[layer_idx].parameters():
+                            param.requires_grad = True
+                # T5 final layer norm
+                if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'final_layer_norm'):
+                    for param in self.model.encoder.final_layer_norm.parameters():
+                        param.requires_grad = True
+                        
+            elif self.model_family == 'xlnet':
+                # XLNetModel: model.layer[i]
+                for layer_idx in layers_to_unfreeze:
+                    if hasattr(self.model, 'layer'):
+                        for param in self.model.layer[layer_idx].parameters():
+                            param.requires_grad = True
+        
+        # Optionally unfreeze embeddings
+        if self.unfreeze_embeddings:
+            if self.model_family == 'bert':
+                if hasattr(self.model, 'embeddings'):
+                    for param in self.model.embeddings.parameters():
+                        param.requires_grad = True
+            elif self.model_family == 't5':
+                if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'embed_tokens'):
+                    for param in self.model.encoder.embed_tokens.parameters():
+                        param.requires_grad = True
+            elif self.model_family == 'xlnet':
+                if hasattr(self.model, 'word_embedding'):
+                    for param in self.model.word_embedding.parameters():
+                        param.requires_grad = True
+        
+        # Projection layer is always trainable
+        if hasattr(self.proj, 'parameters'):
+            for param in self.proj.parameters():
+                param.requires_grad = True
+    
+    def get_trainable_params_info(self) -> Dict[str, int]:
+        """Get information about trainable parameters."""
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen = total - trainable
+        
+        info = {
+            'total': total,
+            'trainable': trainable,
+            'frozen': frozen,
+            'trainable_pct': 100 * trainable / total if total > 0 else 0,
+            'model_family': self.model_family,
+            'model_name': self.model_name,
+            'quantization': self.quantization,
+            'use_lora': self.use_lora,
+        }
+        
+        if self.use_lora:
+            try:
+                lora_params = sum(
+                    p.numel() for n, p in self.model.named_parameters()
+                    if 'lora' in n.lower() and p.requires_grad
+                )
+                info['lora_params'] = lora_params
+            except Exception:
+                pass
+        
+        return info
+    
+    def merge_and_unload_lora(self):
+        """Merge LoRA weights into base model and unload LoRA (for inference)."""
+        if self.use_lora:
+            try:
+                self.model = self.model.merge_and_unload()
+                self.use_lora = False
+                print("LoRA weights merged and unloaded successfully.")
+            except Exception as e:
+                print(f"Failed to merge LoRA: {e}")
+    
+    def save_lora_weights(self, path: str):
+        """Save only the LoRA weights to a file."""
+        if self.use_lora:
+            self.model.save_pretrained(path)
+            print(f"LoRA weights saved to {path}")
+        else:
+            print("LoRA is not enabled, nothing to save.")
+    
+    def load_lora_weights(self, path: str):
+        """Load LoRA weights from a file."""
+        if self.use_lora:
+            try:
+                from peft import PeftModel
+                self.model = PeftModel.from_pretrained(
+                    self.model.base_model.model,
+                    path
+                )
+                print(f"LoRA weights loaded from {path}")
+            except Exception as e:
+                print(f"Failed to load LoRA weights: {e}")
+        else:
+            print("LoRA is not enabled. Initialize with use_lora=True first.")
+    
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            tokens: [batch, seq_len] token indices (includes special tokens + PAD)
+            mask: [batch, seq_len] boolean mask where True = valid, False = padding
+        Returns:
+            embeddings: [batch, seq_len', output_dim]
+                - ProtBERT: seq_len' = seq_len - 1 (CLS removed, SEP zeroed)
+                - ProtT5: seq_len' = seq_len (no leading token to remove, EOS zeroed)
+                - ProtXLNet: seq_len' = seq_len (no leading token, SEP+CLS zeroed)
+        
+        Note on output alignment with ESM2Encoder:
+            ProtBERT follows the same convention as ESM2Encoder (leading CLS
+            removed, trailing SEP zeroed). ProtT5 and ProtXLNet have no leading
+            special token, so no positions are removed — special tokens are
+            zeroed via mask.
+        """
+        if self.model_family == 'bert':
+            return self._forward_bert(tokens, mask)
+        elif self.model_family == 't5':
+            return self._forward_t5(tokens, mask)
+        elif self.model_family == 'xlnet':
+            return self._forward_xlnet(tokens, mask)
+    
+    def _forward_bert(
+        self,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        ProtBERT forward pass.
+        
+        Input tokens:  [CLS] A1 A2 ... An [SEP] [PAD] ...
+        Output:        A1 A2 ... An [SEP-zeroed] [PAD-zeroed] ...
+        
+        Removes CLS (position 0), zeros out SEP and PAD.
+        Same convention as ESM2Encoder for drop-in compatibility.
+        """
+        # Create attention mask (1 = attend, 0 = ignore)
+        if mask is not None:
+            attention_mask = mask.long()
+        else:
+            attention_mask = (tokens != self.padding_idx).long()
+        
+        outputs = self.model(
+            input_ids=tokens,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        
+        # [batch, seq_len, model_dim]
+        representations = outputs.last_hidden_state
+        
+        # Remove CLS (position 0)
+        # [batch, seq_len-1, model_dim]
+        representations = representations[:, 1:, :]
+        
+        # Project
+        x = self.proj(representations)
+        x = self.norm(x)
+        
+        # Mask out SEP and PAD
+        if mask is not None:
+            is_sep = (tokens == self.eos_idx)  # [SEP] acts as EOS
+            mask_no_sep = mask.clone()
+            mask_no_sep[is_sep] = False
+            mask_stripped = mask_no_sep[:, 1:]  # Remove CLS position
+            x = x * mask_stripped.unsqueeze(-1).to(x.dtype)
+        
+        return x
+    
+    def _forward_t5(
+        self,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        ProtT5 forward pass (encoder only).
+        
+        Input tokens:  A1 A2 ... An </s> <pad> ...
+        Output:        A1 A2 ... An [EOS-zeroed] [PAD-zeroed] ...
+        
+        T5 has no CLS/BOS token. The EOS (</s>) is at the end.
+        We keep all positions and zero out EOS and PAD via mask.
+        Output shape: [batch, seq_len, output_dim] (no positions removed,
+        since T5 has no leading BOS/CLS to strip).
+        """
+        # Create attention mask
+        if mask is not None:
+            attention_mask = mask.long()
+        else:
+            attention_mask = (tokens != self.padding_idx).long()
+        
+        outputs = self.model(
+            input_ids=tokens,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        
+        # [batch, seq_len, model_dim]
+        representations = outputs.last_hidden_state
+        
+        # Project
+        x = self.proj(representations)
+        x = self.norm(x)
+        
+        # Mask out EOS and PAD (zero them like ESM does for EOS)
+        if mask is not None:
+            is_eos = (tokens == self.eos_idx)
+            mask_no_eos = mask.clone()
+            mask_no_eos[is_eos] = False
+            x = x * mask_no_eos.unsqueeze(-1).to(x.dtype)
+        
+        return x
+    
+    def _forward_xlnet(
+        self,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        ProtXLNet forward pass.
+        
+        Input tokens (right-aligned, left-padded by default):
+            <pad> ... <pad> A1 A2 ... An <sep> <cls>
+        Output:
+            [PAD-zeroed] ... [PAD-zeroed] A1 A2 ... An [sep-zeroed] [cls-zeroed]
+        
+        XLNet appends <sep> <cls> after the sequence. XLNet uses LEFT padding,
+        so pad tokens appear at the beginning. We keep all positions and zero
+        out <sep>, <cls>, and <pad> via masking (like ESM does for EOS).
+        Output shape: [batch, seq_len, output_dim] (no positions removed).
+        """
+        # Create attention mask (1 = attend, 0 = ignore)
+        if mask is not None:
+            attention_mask = mask.long()
+        else:
+            attention_mask = (tokens != self.padding_idx).long()
+        
+        outputs = self.model(
+            input_ids=tokens,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        
+        # [batch, seq_len, model_dim]
+        representations = outputs.last_hidden_state
+        
+        # Project
+        x = self.proj(representations)
+        x = self.norm(x)
+        
+        # Mask out <sep>, <cls>, and <pad> positions
+        if mask is not None:
+            is_sep = (tokens == self.eos_idx)           # <sep>
+            is_cls = (tokens == self._xlnet_cls_idx)    # <cls>
+            mask_cleaned = mask.clone()
+            mask_cleaned[is_sep] = False
+            mask_cleaned[is_cls] = False
+            x = x * mask_cleaned.unsqueeze(-1).to(x.dtype)
+        
+        return x
             
 # END============================================================================
 # Sequence Encoders
@@ -3176,6 +3803,367 @@ class DinoMHC(nn.Module):
         return outputs 
 # END============================================================================
 # Main Net
+# ===============================================================================
+
+
+# START==========================================================================
+# Main Net (ProtTrans variant)
+# ===============================================================================
+class DinoMHC_ProtTrans(DinoMHC):
+    """
+    DinoMHC variant using ProtTrans family encoders (ProtBERT, ProtT5, ProtXLNet).
+    
+    Inherits all core modules from DinoMHC:
+    - Hierarchical Groove Extractor
+    - Position-Aware Peptide Encoder
+    - Groove-Peptide Fusion
+    - Interface Geometry Reasoning
+    - Multi-task prediction heads
+    
+    Overrides encoder building and sequence encoding to handle ProtTrans
+    tokenization conventions:
+    
+    ProtBERT:  [CLS] A1 A2 ... An [SEP] [PAD]  →  output: seq_len - 1 (CLS removed)
+    ProtT5:    A1 A2 ... An </s> <pad>          →  output: seq_len (no removal)
+    ProtXLNet: <pad>... A1 A2 ... An <sep> <cls> → output: seq_len (no removal)
+    
+    Encoder Options:
+    - 'protbert':        Separate ProtBERT for peptide and MHC
+    - 'protbert_shared': Single shared ProtBERT
+    - 'prott5':          Separate ProtT5 encoders
+    - 'prott5_shared':   Single shared ProtT5
+    - 'protxlnet':       Separate ProtXLNet encoders
+    - 'protxlnet_shared': Single shared ProtXLNet
+    - 'embedding':       Simple nn.Embedding (fast, for prototyping)
+    
+    Usage:
+        config = {
+            'encoder_type': 'prott5',
+            'prottrans_model_name': 'Rostlab/prot_t5_xl_uniref50',
+            'prottrans_unfreeze_layers': 2,
+            'prottrans_use_lora': True,
+        }
+        model = DinoMHC_ProtTrans(config)
+    """
+    
+    # Map encoder_type to ProtTransEncoder model_name defaults
+    _DEFAULT_MODEL_NAMES = {
+        'protbert': 'Rostlab/prot_bert',
+        'protbert_shared': 'Rostlab/prot_bert',
+        'prott5': 'Rostlab/prot_t5_xl_uniref50',
+        'prott5_shared': 'Rostlab/prot_t5_xl_uniref50',
+        'protxlnet': 'Rostlab/prot_xlnet',
+        'protxlnet_shared': 'Rostlab/prot_xlnet',
+    }
+    
+    def __init__(self, config: Optional[Dict] = None):
+        # Build ProtTrans-specific default config before calling parent __init__
+        default_config = {
+            'dim': 320,
+            'num_groove_tokens': 60,
+            'num_fusion_layers': 4,
+            'num_geometry_blocks': 3,
+            'num_heads': 8,
+            'dropout': 0.1,
+            'max_peptide_length': 15,
+            'task_head': 'presentation',
+            # Encoder configuration (ProtTrans-specific)
+            'encoder_type': 'protbert',  # 'protbert', 'protbert_shared', 'prott5', 'prott5_shared', 'protxlnet', 'protxlnet_shared', 'embedding'
+            'prottrans_model_name': 'Rostlab/prot_bert',
+            'prottrans_unfreeze_layers': 2,
+            'prottrans_unfreeze_embeddings': False,
+            # Flank configuration
+            'use_flanks': True,
+            'flank_pooling': 'mean',
+            # Quantization and LoRA
+            'prottrans_quantization': None,
+            'prottrans_use_lora': False,
+            'prottrans_lora_r': 8,
+            'prottrans_lora_alpha': 16,
+            'prottrans_lora_dropout': 0.1,
+            'prottrans_lora_target_modules': None,  # Auto-detected per model family
+        }
+        
+        if config is not None:
+            default_config.update(config)
+        
+        # Resolve model name from encoder_type if not explicitly set
+        enc_type = default_config['encoder_type']
+        if enc_type in self._DEFAULT_MODEL_NAMES:
+            if config is None or 'prottrans_model_name' not in config:
+                default_config['prottrans_model_name'] = self._DEFAULT_MODEL_NAMES[enc_type]
+        
+        # Call grandparent (nn.Module) init directly, bypassing DinoMHC.__init__
+        # so we can set up our own config without ESM defaults
+        nn.Module.__init__(self)
+        
+        self.config = default_config
+        dim = default_config['dim']
+        
+        # === Build Encoders ===
+        self._build_encoders(default_config)
+        
+        # === Core Modules (same as DinoMHC) ===
+        self.groove_extractor = HierarchicalGrooveExtractor(
+            dim=dim,
+            num_groove_tokens=default_config['num_groove_tokens'],
+            num_heads=default_config['num_heads'],
+            dropout=default_config['dropout']
+        )
+        
+        self.position_encoder = PositionAwarePeptideEncoder(
+            dim=dim,
+            max_peptide_length=default_config['max_peptide_length'],
+            dropout=default_config['dropout']
+        )
+        
+        self.groove_peptide_fusion = GroovePeptideFusion(
+            dim=dim,
+            num_layers=default_config['num_fusion_layers'],
+            num_heads=default_config['num_heads'],
+            dropout=default_config['dropout'],
+            max_peptide_length=default_config['max_peptide_length'],
+            num_groove_tokens=default_config['num_groove_tokens']
+        )
+        
+        self.interface_geometry = InterfaceGeometryModule(
+            dim=dim,
+            num_blocks=default_config['num_geometry_blocks'],
+            num_heads=default_config['num_heads'] // 2,
+            dropout=default_config['dropout'],
+            max_relative_pos=default_config['max_peptide_length'] + default_config['num_groove_tokens']
+        )
+        
+        # === Prediction Heads ===
+        use_flanks = default_config.get('use_flanks', False)
+        if default_config['task_head'] == 'affinity':
+            self.task_head = BindingAffinityHead(dim, default_config['dropout'], use_flanks=use_flanks)
+        elif default_config['task_head'] == 'presentation':
+            self.task_head = PresentationHead(dim, default_config['dropout'], use_flanks=use_flanks)
+        elif default_config['task_head'] == 'contact':
+            self.task_head = ContactPredictionHead(dim, default_config['dropout'])
+        else:
+            raise ValueError(
+                f"Unknown task_head: {default_config['task_head']}, "
+                "must be one of 'affinity', 'presentation', 'contact'"
+            )
+    
+    def _build_encoders(self, config: Dict):
+        """Build ProtTrans sequence encoders based on configuration."""
+        dim = config['dim']
+        encoder_type = config['encoder_type']
+        
+        # Store model family and special token info for mask adjustment
+        self._encoder_family = None  # 'bert', 't5', 'xlnet', or None (embedding)
+        self._eos_idx = None
+        self._cls_idx = None  # For XLNet's trailing <cls>
+        self._has_leading_cls = False  # Whether model prepends CLS (ProtBERT yes, T5/XLNet no)
+        
+        # Extract ProtTrans-specific config options
+        prottrans_kwargs = {
+            'output_dim': dim,
+            'model_name': config.get('prottrans_model_name', 'Rostlab/prot_bert'),
+            'unfreeze_layers': config.get('prottrans_unfreeze_layers', 2),
+            'unfreeze_embeddings': config.get('prottrans_unfreeze_embeddings', False),
+            'quantization': config.get('prottrans_quantization', None),
+            'use_lora': config.get('prottrans_use_lora', False),
+            'lora_r': config.get('prottrans_lora_r', 8),
+            'lora_alpha': config.get('prottrans_lora_alpha', 16),
+            'lora_dropout': config.get('prottrans_lora_dropout', 0.1),
+            'lora_target_modules': config.get('prottrans_lora_target_modules', None),
+        }
+        
+        if encoder_type == 'embedding':
+            self.peptide_encoder = EmbeddingEncoder(dim)
+            self.mhc_encoder = EmbeddingEncoder(dim)
+            self.shared_encoder = False
+            
+        elif encoder_type in ('protbert', 'prott5', 'protxlnet'):
+            # Separate encoders for peptide and MHC
+            self.peptide_encoder = ProtTransEncoder(**prottrans_kwargs)
+            self.mhc_encoder = ProtTransEncoder(**prottrans_kwargs)
+            
+            # Freeze MHC encoder (same strategy as DinoMHC)
+            for param in self.mhc_encoder.parameters():
+                param.requires_grad = False
+            self.mhc_encoder.eval()
+            
+            self.shared_encoder = False
+            self._setup_token_info(self.peptide_encoder)
+            
+        elif encoder_type in ('protbert_shared', 'prott5_shared', 'protxlnet_shared'):
+            # Single shared encoder
+            self.shared_prottrans_encoder = ProtTransEncoder(**prottrans_kwargs)
+            self.peptide_encoder = self.shared_prottrans_encoder
+            self.mhc_encoder = self.shared_prottrans_encoder
+            self.shared_encoder = True
+            self._setup_token_info(self.shared_prottrans_encoder)
+            
+        else:
+            raise ValueError(
+                f"Unknown encoder_type: {encoder_type}, "
+                "must be one of 'embedding', 'protbert', 'protbert_shared', "
+                "'prott5', 'prott5_shared', 'protxlnet', 'protxlnet_shared'"
+            )
+    
+    def _setup_token_info(self, encoder: ProtTransEncoder):
+        """Extract token info from a ProtTransEncoder for mask adjustment."""
+        self._encoder_family = encoder.model_family
+        self._eos_idx = encoder.eos_idx
+        
+        if self._encoder_family == 'bert':
+            # ProtBERT: [CLS] seq [SEP] [PAD] — CLS is leading, SEP is EOS
+            self._has_leading_cls = True
+        elif self._encoder_family == 't5':
+            # ProtT5: seq </s> <pad> — no leading token
+            self._has_leading_cls = False
+        elif self._encoder_family == 'xlnet':
+            # ProtXLNet: <pad>... seq <sep> <cls> — no leading token, trailing CLS
+            self._has_leading_cls = False
+            self._cls_idx = getattr(encoder, '_xlnet_cls_idx', None)
+    
+    def encode_sequences(
+        self,
+        peptide_tokens: torch.Tensor,
+        mhc_tokens: torch.Tensor,
+        peptide_mask: Optional[torch.Tensor] = None,
+        mhc_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Encode peptide and MHC sequences using ProtTrans encoders.
+        
+        Handles mask adjustment for each ProtTrans family:
+        
+        ProtBERT (bert):
+            - Encoder removes CLS (pos 0), zeros SEP → output: seq_len - 1
+            - Mask: mark SEP invalid, strip pos 0 (same as ESM2)
+        
+        ProtT5 (t5):
+            - Encoder zeros EOS, keeps all positions → output: seq_len
+            - Mask: mark EOS invalid, keep same length
+        
+        ProtXLNet (xlnet):
+            - Encoder zeros <sep> and <cls>, keeps all positions → output: seq_len
+            - Mask: mark <sep> and <cls> invalid, keep same length
+        
+        Args:
+            peptide_tokens: Tokenized peptide [batch, pep_len]
+            mhc_tokens: Tokenized MHC [batch, mhc_len]
+            peptide_mask: Boolean mask where True = valid, False = padding
+            mhc_mask: Boolean mask where True = valid, False = padding
+        
+        Returns:
+            peptide_emb: Encoded peptide embeddings
+            mhc_emb: Encoded MHC embeddings
+            peptide_mask_out: Adjusted mask matching peptide_emb length
+            mhc_mask_out: Adjusted mask matching mhc_emb length
+        """
+        peptide_emb = self.peptide_encoder(peptide_tokens, mask=peptide_mask)
+        mhc_emb = self.mhc_encoder(mhc_tokens, mask=mhc_mask)
+        
+        peptide_mask_out = peptide_mask
+        mhc_mask_out = mhc_mask
+        
+        if self._encoder_family is None:
+            # Embedding encoder — no special token handling
+            return peptide_emb, mhc_emb, peptide_mask_out, mhc_mask_out
+        
+        if self._encoder_family == 'bert':
+            # ProtBERT: same convention as ESM2
+            # Encoder strips CLS (pos 0) and zeros SEP
+            # Mask: mark SEP as invalid, then remove pos 0
+            eos_idx = self._eos_idx  # SEP token
+            
+            if peptide_mask is not None:
+                is_sep = (peptide_tokens == eos_idx)
+                pep_mask = peptide_mask.clone()
+                pep_mask[is_sep] = False
+                peptide_mask_out = pep_mask[:, 1:]  # Remove CLS position
+            
+            if mhc_mask is not None:
+                is_sep = (mhc_tokens == eos_idx)
+                mhc_mask_adj = mhc_mask.clone()
+                mhc_mask_adj[is_sep] = False
+                mhc_mask_out = mhc_mask_adj[:, 1:]  # Remove CLS position
+                
+        elif self._encoder_family == 't5':
+            # ProtT5: no leading token removed, EOS zeroed
+            # Mask: mark EOS as invalid, keep same length
+            eos_idx = self._eos_idx
+            
+            if peptide_mask is not None:
+                is_eos = (peptide_tokens == eos_idx)
+                pep_mask = peptide_mask.clone()
+                pep_mask[is_eos] = False
+                peptide_mask_out = pep_mask
+            
+            if mhc_mask is not None:
+                is_eos = (mhc_tokens == eos_idx)
+                mhc_mask_adj = mhc_mask.clone()
+                mhc_mask_adj[is_eos] = False
+                mhc_mask_out = mhc_mask_adj
+                
+        elif self._encoder_family == 'xlnet':
+            # ProtXLNet: no leading token removed, <sep> and <cls> zeroed
+            # Mask: mark <sep> and <cls> as invalid, keep same length
+            sep_idx = self._eos_idx
+            cls_idx = self._cls_idx
+            
+            if peptide_mask is not None:
+                is_special = (peptide_tokens == sep_idx)
+                if cls_idx is not None:
+                    is_special = is_special | (peptide_tokens == cls_idx)
+                pep_mask = peptide_mask.clone()
+                pep_mask[is_special] = False
+                peptide_mask_out = pep_mask
+            
+            if mhc_mask is not None:
+                is_special = (mhc_tokens == sep_idx)
+                if cls_idx is not None:
+                    is_special = is_special | (mhc_tokens == cls_idx)
+                mhc_mask_adj = mhc_mask.clone()
+                mhc_mask_adj[is_special] = False
+                mhc_mask_out = mhc_mask_adj
+        
+        return peptide_emb, mhc_emb, peptide_mask_out, mhc_mask_out
+    
+    def get_encoder_info(self) -> Dict:
+        """Get information about encoder configuration and parameters."""
+        info = {
+            'encoder_type': self.config['encoder_type'],
+            'shared_encoder': self.shared_encoder,
+            'model_family': self._encoder_family,
+        }
+        
+        enc_type = self.config['encoder_type']
+        if enc_type != 'embedding':
+            if self.shared_encoder:
+                info['encoder_params'] = self.shared_prottrans_encoder.get_trainable_params_info()
+            else:
+                info['peptide_encoder_params'] = self.peptide_encoder.get_trainable_params_info()
+                info['mhc_encoder_params'] = self.mhc_encoder.get_trainable_params_info()
+        
+        return info
+    
+    def unfreeze_encoder_layers(self, num_layers: int = 2):
+        """
+        Unfreeze top N layers of ProtTrans encoders.
+        Only works for ProtTrans encoders (not embedding).
+        """
+        if self.config['encoder_type'] == 'embedding':
+            print("Warning: unfreeze_encoder_layers has no effect on embedding encoders")
+            return
+        
+        if self.shared_encoder:
+            self.shared_prottrans_encoder.unfreeze_layers = num_layers
+            self.shared_prottrans_encoder._apply_freeze_strategy()
+        else:
+            self.peptide_encoder.unfreeze_layers = num_layers
+            self.peptide_encoder._apply_freeze_strategy()
+            self.mhc_encoder.unfreeze_layers = num_layers
+            self.mhc_encoder._apply_freeze_strategy()
+# END============================================================================
+# Main Net (ProtTrans variant)
 # ===============================================================================
 
 

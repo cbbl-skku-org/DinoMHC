@@ -70,6 +70,115 @@ def simple_tokenize(
     return torch.tensor(tokens, dtype=torch.long), torch.tensor(mask, dtype=torch.bool)
 
 
+class ProtTransTokenizer:
+    """
+    Wrapper for ProtTrans family tokenization (ProtBERT, ProtT5, ProtXLNet).
+    
+    ProtTrans models expect spaces between amino acids.
+    Handles batch tokenization with proper padding.
+    
+    Model families:
+    - ProtBERT (Rostlab/prot_bert):  [CLS] A1 A2 ... An [SEP] [PAD]
+    - ProtT5 (Rostlab/prot_t5_*):    A1 A2 ... An </s> <pad>
+    - ProtXLNet (Rostlab/prot_xlnet): <pad>... A1 A2 ... An <sep> <cls>
+    """
+    def __init__(self, model_name: str = "Rostlab/prot_bert"):
+        try:
+            from transformers import AutoTokenizer
+            
+            # Detect model family from model_name
+            name_lower = model_name.lower()
+            if 'xlnet' in name_lower:
+                self.family = 'xlnet'
+            elif 't5' in name_lower:
+                self.family = 't5'
+            else:
+                self.family = 'bert'
+            
+            # ProtTrans tokenizers use SentencePiece; use_fast=False avoids
+            # conversion issues with T5 and XLNet tokenizers
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+            self.padding_idx = self.tokenizer.pad_token_id
+        except ImportError:
+            raise ImportError("Transformers package not found. Install with: pip install transformers")
+    
+    def _space_sequence(self, sequence: str) -> str:
+        """Insert spaces between amino acids as required by ProtTrans models."""
+        return " ".join(list(sequence))
+    
+    def tokenize(
+        self,
+        sequence: str,
+        max_length: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Tokenize a single sequence.
+        
+        Args:
+            sequence: Amino acid sequence string (no spaces)
+            max_length: Maximum total length including special tokens
+        
+        Returns:
+            tokens: [max_length] token indices
+            mask: [max_length] boolean mask (True = non-padding)
+        """
+        spaced_seq = self._space_sequence(sequence)
+        encoded = self.tokenizer(
+            spaced_seq,
+            add_special_tokens=True,
+            truncation=True,
+            max_length=max_length,
+            padding='max_length',
+            return_tensors='pt'
+        )
+        
+        tokens = encoded['input_ids'].squeeze(0)
+        attention_mask = encoded['attention_mask'].squeeze(0)
+        mask = attention_mask.bool()
+        
+        # Mask 'X' (unknown) tokens as False
+        x_token_id = self.tokenizer.convert_tokens_to_ids('X')
+        if x_token_id is not None and x_token_id != self.tokenizer.unk_token_id:
+            mask = mask & (tokens != x_token_id)
+        
+        return tokens, mask
+    
+    def tokenize_batch(
+        self,
+        sequences: List[str],
+        max_length: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Tokenize a batch of sequences.
+        
+        Args:
+            sequences: List of amino acid sequences (no spaces)
+            max_length: Maximum total length including special tokens
+        
+        Returns:
+            tokens: [batch, max_length] token indices
+            mask: [batch, max_length] boolean mask
+        """
+        spaced_sequences = [self._space_sequence(seq) for seq in sequences]
+        encoded = self.tokenizer(
+            spaced_sequences,
+            add_special_tokens=True,
+            truncation=True,
+            max_length=max_length,
+            padding='max_length',
+            return_tensors='pt'
+        )
+        
+        tokens = encoded['input_ids']
+        mask = encoded['attention_mask'].bool()
+        
+        x_token_id = self.tokenizer.convert_tokens_to_ids('X')
+        if x_token_id is not None and x_token_id != self.tokenizer.unk_token_id:
+            mask = mask & (tokens != x_token_id)
+        
+        return tokens, mask
+
+
 class ESMTokenizer:
     """
     Wrapper for ESM-2 tokenization using Hugging Face Transformers.
@@ -169,7 +278,7 @@ class MHCPeptideDataset(Dataset):
     
     Supports:
     - CSV files with columns: peptide, mhc, label (and optionally nflank, cflank, prot)
-    - Simple embedding tokenization or ESM-2 tokenization
+    - Simple embedding tokenization, ESM-2 tokenization, or ProtTrans tokenization
     - Optional flanking sequences
     - Label binarization or continuous labels
     - Random flank masking for robustness (flank_mask_prob)
@@ -179,8 +288,9 @@ class MHCPeptideDataset(Dataset):
         self,
         data_path: str,
         mhc_seq_path: Optional[str] = None,
-        tokenizer_type: str = 'embedding',  # 'embedding' or 'esm2'
+        tokenizer_type: str = 'embedding',  # 'embedding', 'esm2', or 'prottrans'
         esm_model_name: str = 'facebook/esm2_t6_8M_UR50D',
+        prottrans_model_name: str = 'Rostlab/prot_bert',
         max_peptide_length: int = 15,
         max_mhc_length: int = 385,  # MHC-I pseudo sequence length + BOS/EOS for ESM
         use_flanks: bool = False,
@@ -196,9 +306,10 @@ class MHCPeptideDataset(Dataset):
         Args:
             data_path: Path to CSV file with peptide-MHC-label data
             mhc_seq_path: Path to CSV with MHC allele sequences (columns: allele, sequence)
-            tokenizer_type: 'embedding' for simple vocab, 'esm2' for ESM tokenization
+            tokenizer_type: 'embedding' for simple vocab, 'esm2' for ESM, 'prottrans' for ProtTrans
             esm_model_name: ESM model name if using ESM tokenization
-            max_peptide_length: Maximum peptide length (including BOS/EOS for ESM)
+            prottrans_model_name: ProtTrans model name if using ProtTrans tokenization
+            max_peptide_length: Maximum peptide length (including special tokens for ESM/ProtTrans)
             max_mhc_length: Maximum MHC sequence length
             use_flanks: Whether to include flanking sequences
             flank_length: Length of N-terminal and C-terminal flanks
@@ -239,6 +350,8 @@ class MHCPeptideDataset(Dataset):
         # Initialize tokenizer
         if tokenizer_type == 'esm2':
             self.tokenizer = ESMTokenizer(esm_model_name)
+        elif tokenizer_type == 'prottrans':
+            self.tokenizer = ProtTransTokenizer(prottrans_model_name)
         else:
             self.tokenizer = None  # Use simple_tokenize
         
@@ -252,6 +365,14 @@ class MHCPeptideDataset(Dataset):
 
         if tokenizer_type == 'esm2':
             self.effective_peptide_length = max_peptide_with_flanks + 2  # +2 for BOS/EOS
+            self.effective_mhc_length = max_mhc_length + 2
+        elif tokenizer_type == 'prottrans':
+            # ProtTrans models also add special tokens:
+            # ProtBERT: +2 (CLS + SEP)
+            # ProtT5: +1 (EOS only)
+            # ProtXLNet: +2 (SEP + CLS trailing)
+            # Use +2 as safe upper bound for all families
+            self.effective_peptide_length = max_peptide_with_flanks + 2
             self.effective_mhc_length = max_mhc_length + 2
         else:
             self.effective_peptide_length = max_peptide_with_flanks
@@ -355,7 +476,7 @@ class MHCPeptideDataset(Dataset):
             label = 1.0 if label >= self.label_threshold else 0.0
 
         # Tokenize
-        if self.tokenizer_type == 'esm2':
+        if self.tokenizer_type in ('esm2', 'prottrans'):
             peptide_tokens, peptide_mask = self.tokenizer.tokenize(
                 peptide, self.effective_peptide_length
             )
@@ -427,6 +548,7 @@ class MHCPeptideDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         tokenizer_type: str = 'embedding',
         esm_model_name: str = 'facebook/esm2_t6_8M_UR50D',
+        prottrans_model_name: str = 'Rostlab/prot_bert',
         max_peptide_length: int = 15,
         max_mhc_length: int = 385,
         use_flanks: bool = False,
@@ -444,8 +566,9 @@ class MHCPeptideDataModule(pl.LightningDataModule):
             fold: Which fold to use (0-4 for 5-fold CV)
             batch_size: Batch size for training
             num_workers: Number of data loading workers
-            tokenizer_type: 'embedding' or 'esm2'
+            tokenizer_type: 'embedding', 'esm2', or 'prottrans'
             esm_model_name: ESM model name if using ESM
+            prottrans_model_name: ProtTrans model name if using ProtTrans
             max_peptide_length: Max peptide length
             max_mhc_length: Max MHC sequence length
             use_flanks: Whether to use flanking sequences
@@ -470,6 +593,7 @@ class MHCPeptideDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.tokenizer_type = tokenizer_type
         self.esm_model_name = esm_model_name
+        self.prottrans_model_name = prottrans_model_name
         self.max_peptide_length = max_peptide_length
         self.max_mhc_length = max_mhc_length
         self.use_flanks = use_flanks
@@ -492,6 +616,7 @@ class MHCPeptideDataModule(pl.LightningDataModule):
             'mhc_seq_path': self.mhc_seq_path,
             'tokenizer_type': self.tokenizer_type,
             'esm_model_name': self.esm_model_name,
+            'prottrans_model_name': self.prottrans_model_name,
             'max_peptide_length': self.max_peptide_length,
             'max_mhc_length': self.max_mhc_length,
             'use_flanks': self.use_flanks,

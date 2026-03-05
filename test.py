@@ -270,18 +270,48 @@ def test_benchmark(
     # Determine which module class to use based on checkpoint
     model_config = {'config': get_model_config(config)}
 
-    model = create_lightning_module(
-        # config=config['model'],
-        use_allele_balanced_loss=config['loss'].get('use_allele_balanced_loss', False),
-        **model_config
-    )
+    # Determine the Lightning module class
+    use_allele_balanced_loss = config['loss'].get('use_allele_balanced_loss', False)
 
-    state_dict = torch.load(checkpoint_path, map_location=device)
+    # Check if checkpoint is a DeepSpeed directory or a regular .ckpt file
+    ckpt_path = Path(checkpoint_path)
+    if ckpt_path.is_dir():
+        # DeepSpeed ZeRO shards model weights across multiple files in a directory,
+        # so we need to gather them into a single state dict for inference.
+        from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 
-    model.load_state_dict(state_dict, strict=True)
-    # model = model.to(torch.bfloat16)
+        if verbose:
+            print(f"Loading DeepSpeed ZeRO checkpoint from directory: {ckpt_path}")
+
+        # Get consolidated FP32 state dict directly in memory (no intermediate file)
+        state_dict = get_fp32_state_dict_from_zero_checkpoint(str(ckpt_path))
+
+        if use_allele_balanced_loss:
+            from src.lightning_module import DinoMHCWithAlleleBalancedFocalLoss
+            model = DinoMHCWithAlleleBalancedFocalLoss(config=model_config['config'])
+        else:
+            from src.lightning_module import DinoMHCLightningModule
+            model = DinoMHCLightningModule(config=model_config['config'])
+
+        model.load_state_dict(state_dict, strict=True)
+    else:
+        # Regular .ckpt file — use Lightning's load_from_checkpoint
+        if use_allele_balanced_loss:
+            from src.lightning_module import DinoMHCWithAlleleBalancedFocalLoss
+            model = DinoMHCWithAlleleBalancedFocalLoss.load_from_checkpoint(
+                checkpoint_path,
+                map_location=device,
+                config=model_config['config'],
+            )
+        else:
+            from src.lightning_module import DinoMHCLightningModule
+            model = DinoMHCLightningModule.load_from_checkpoint(
+                checkpoint_path,
+                map_location=device,
+                config=model_config['config'],
+            )
+
     model = model.to(torch.bfloat16)
-    
     model.eval()
 
     if verbose:
@@ -434,7 +464,7 @@ def main():
             print(f"Error: Test file not found: {test_file}")
             sys.exit(1)
 
-    # Verify checkpoint exists
+    # Verify checkpoint exists (can be a file or a DeepSpeed directory)
     if not Path(args.checkpoint).exists():
         print(f"Error: Checkpoint not found: {args.checkpoint}")
         sys.exit(1)
