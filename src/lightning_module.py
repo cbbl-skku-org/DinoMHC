@@ -29,7 +29,7 @@ from torchmetrics import (
     MatthewsCorrCoef
 )
 
-from .model import DinoMHC, DinoMHC_ProtTrans
+from .model import DinoMHC, DinoMHC_ProtTrans, DinoMHC_IGeoReasonAblation, DinoMHC_FusionLayerAblation
 
 
 def find_optimal_threshold_pr(
@@ -289,7 +289,7 @@ class DinoMHCLightningModule(pl.LightningModule):
         if encoder_type in prottrans_types:
             self.model = DinoMHC_ProtTrans(config)
         else:
-            self.model = DinoMHC(config)
+            self.model = DinoMHC_FusionLayerAblation(config) # DinoMHC_IGeoReasonAblation(config) #DinoMHC(config)
         
         # Task type from config
         self.task_type = self.config.get('task_head', 'presentation')
