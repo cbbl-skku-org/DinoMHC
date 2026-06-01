@@ -3,8 +3,10 @@ datasets/
 calculate_metrics*
 *_results
 exp_*
-
+results_bench_time/
+weights/
 tune_*/
+test_calculate.py
 
 # Ckpts and logs
 outputs/

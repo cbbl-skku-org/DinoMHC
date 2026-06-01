@@ -640,7 +640,6 @@ def main():
     
     if args.train_all_folds:
         for fold in range(3):
-            print('ARGS:', args.resume_from_checkpoint)
             result = train_fold(config, fold, args.verbose, args.resume_from_checkpoint)
             results.append(result)
         

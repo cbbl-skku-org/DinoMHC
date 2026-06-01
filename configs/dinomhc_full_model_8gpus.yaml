@@ -1,29 +1,22 @@
-# DinoMHC Test Configuration (10% Dataset)
-# =====================================================
-# This config uses the 10% stratified sample for quick testing
-# Created from: datasets/el/EL_Train.csv (892,539 samples)
-# Distribution maintained: 138 MHC alleles, 7.29% positive ratio
-
 # Data Configuration
 data:
-  data_dir: datasets/el/MAYBE_FINAL_DATA_23DEC
+  data_dir: datasets/MS/folds
   num_workers: 64
   use_flanks: true
   flank_length: 5
   flank_mask_prob: 0.2  # Randomly mask 20% of samples' flanks during training
   max_peptide_length: 15
   max_mhc_length: 300
-  test_files: # Test after each epoch
-    - '/home/bala/digermhc/datasets/el/Experimental_Data - Original_Data.csv'
+  test_files:
 
 # Model Configuration
 model:
   encoder_type: esm2  # embedding, esm2, esm2_shared
-  dim: 128
+  dim: 512
   num_groove_tokens: 60
-  num_fusion_layers: 1
-  num_geometry_blocks: 2
-  num_heads: 4
+  num_fusion_layers: 2
+  num_geometry_blocks: 5
+  num_heads: 8
   dropout: 0.1
   task_head: 'presentation'
   flank_pooling: 'mean'
@@ -42,16 +35,21 @@ esm:
   lora_dropout: 0.1   # LoRA dropout
   lora_target_modules: ['query', 'key', 'value']  # null = default ['query', 'key', 'value']
 
+prottrans:
+  model_name: null
+  unfreeze_layers: null
+  unfreeze_embeddings: null
+
 # Training Configuration
 training:
-  batch_size: 58
-  learning_rate: 0.001
-  weight_decay: 0.0006
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.01
   encoder_lr_factor: 0.1
   warmup_steps: 1500
-  max_epochs: 20
+  max_epochs: 50
   max_steps: -1  # -1 for no limit
-  accumulate_grad_batches: 9
+  accumulate_grad_batches: 16
   gradient_clip_val: 1.0
   precision: "bf16-mixed"  # 32, 16-mixed, bf16-mixed
 
@@ -61,7 +59,7 @@ loss:
   use_allele_balanced_loss: true
 
   # Focal loss parameters (for class imbalance: negative vs positive)
-  focal_alpha: 0.45  # Weight for positive class
+  focal_alpha: 0.7  # Weight for positive class
   focal_gamma: 2.0   # Focusing parameter (higher = more focus on hard examples)
 
   # Allele balancing parameters (for allele imbalance)
@@ -85,10 +83,10 @@ hardware:
 
 # Logging Configuration
 logging:
-  experiment_name: dinomhc_fusion_1_geometric_2
-  output_dir: /data/balalab/dinomhc/tune_num_layers_use_lora_unshared_encoder_freeze_MHC_branch/dinomhc_fusion_1_geometric_2
+  experiment_name: dinomhc_full_model
+  output_dir: weights/dinomhc_training_logs/dinomhc_full_model
   use_wandb: false
-  wandb_project: dinomhc_fusion_1_geometric_2
+  wandb_project: dinomhc_full_model
   wandb_entity: null
 
 # Miscellaneous

@@ -1,505 +1,454 @@
-#!/usr/bin/env python
-"""
-Test script for DinoMHC on benchmark datasets.
-
-This script:
-1. Loads a trained model checkpoint
-2. Runs inference on benchmark test datasets
-3. Computes and reports comprehensive metrics including:
-   - Overall metrics (AUROC, AUPRC, Accuracy, F1, MCC, etc.)
-   - Per-MHC metrics with optimal thresholds
-   - Macro-averaged metrics across MHCs
-4. Saves predictions and results to CSV files
-
-Usage:
-    # Test on a single benchmark dataset
-    python test.py --checkpoint outputs/experiment/fold_0/checkpoints/best.ckpt \
-                   --test_file datasets/el/EL_Test_Multiallelic.csv \
-                   --output_dir test_results
-
-    # Test on multiple benchmark datasets
-    python test.py --checkpoint outputs/experiment/fold_0/checkpoints/best.ckpt \
-                   --test_files datasets/el/EL_Test_Multiallelic.csv \
-                               datasets/el/IM_Test_EBV.csv \
-                               datasets/el/IM_Test_HIV_Acute.csv \
-                   --output_dir test_results
-
-    # Test with config file
-    python test.py --checkpoint outputs/experiment/fold_0/checkpoints/best.ckpt \
-                   --config configs/default.yaml \
-                   --test_file datasets/el/EL_Test_Multiallelic.csv
-"""
-
-import os
-import sys
 import argparse
-import yaml
+import json, yaml
+import tempfile
+from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 from pathlib import Path
-from typing import Optional, Dict, Any, List
-import pandas as pd
-
+from src.model import DinoMHC, DinoMHC_ProtTrans
 import torch
-
-try:
-    import pytorch_lightning as pl
-    from pytorch_lightning.callbacks import RichProgressBar
-except ImportError:
-    import lightning as pl
-    from lightning.pytorch.callbacks import RichProgressBar
-
 from src.data_module import MHCPeptideDataModule
-from src.lightning_module import create_lightning_module
+import csv
+import pandas as pd
+from tqdm import tqdm
+import numpy as np
+
+from sklearn.metrics import (
+    confusion_matrix,
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    matthews_corrcoef,
+    roc_auc_score,
+    average_precision_score
+)
+
+torch._dynamo.config.capture_scalar_outputs = True
 
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from YAML file."""
+def centroid_trim(peptide: str, target_length: int = 9, n_anchors: int = 4) -> str:
+    """
+    Trims a peptide to a target length by removing residues from the middle.
+
+    Keeps the first `n_anchors` residues from the N-terminus and the remaining
+    `target_length - n_anchors` residues from the C-terminus, deleting everything
+    in between.
+    """
+    current_length = len(peptide)
+
+    # If it's already the right length (or shorter), return as-is
+    if current_length <= target_length:
+        return peptide
+
+    c_length = target_length - n_anchors
+
+    if c_length <= 0:
+        return peptide[:target_length]
+
+    # Keep n_anchors from N-term and c_length from C-term
+    trimmed_peptide = peptide[:n_anchors] + peptide[-c_length:]
+    
+    return trimmed_peptide
+
+
+def build_inference_df(original_df, max_supported_length, centroid_target_length=9, n_anchors=4):
+    if "peptide" not in original_df.columns:
+        raise ValueError("Input dataset must contain column 'peptide'")
+
+    base_df = original_df.reset_index(drop=True).copy()
+    base_df["__orig_index"] = np.arange(len(base_df))
+
+    expanded_records = []
+    for _, row in base_df.iterrows():
+        peptide = str(row["peptide"]).strip().upper()
+
+        if len(peptide) <= max_supported_length:
+            rec = row.to_dict()
+            rec["peptide"] = peptide
+            expanded_records.append(rec)
+        else:
+            # Peptide is longer than supported MAX — trim it
+            trimmed = centroid_trim(peptide, target_length=centroid_target_length, n_anchors=n_anchors)
+            rec = row.to_dict()
+            rec["peptide"] = trimmed
+            expanded_records.append(rec)
+
+    expanded_df = pd.DataFrame.from_records(expanded_records)
+    if expanded_df.empty:
+        raise ValueError("Expanded inference dataset is empty")
+
+    return base_df, expanded_df
+
+
+def aggregate_window_predictions(expanded_combined_df, base_df, prediction_columns):
+    # Since we use centroid_trim, it's a 1-to-1 mapping. No aggregation needed, just merge predictions.
+    final_df = base_df.copy()
+    
+    final_df["__n_windows"] = 1
+
+    for col in prediction_columns + ["prediction"]:
+        final_df[col] = expanded_combined_df[col].values
+
+    return final_df
+
+def load_config(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
 
-def get_model_config(config: Dict) -> Dict[str, Any]:
-    """Build model configuration from config dict."""
-    model_config = {
-        'dim': config['model']['dim'],
-        'num_groove_tokens': config['model']['num_groove_tokens'],
-        'num_fusion_layers': config['model']['num_fusion_layers'],
-        'num_geometry_blocks': config['model']['num_geometry_blocks'],
-        'num_heads': config['model']['num_heads'],
-        'dropout': config['model']['dropout'],
-        'max_peptide_length': config['data']['max_peptide_length'],
-        'task_head': config['model']['task_head'],
-        'use_flanks': config['data']['use_flanks'],
-        'flank_pooling': config['model']['flank_pooling'],
-        'encoder_type': config['model']['encoder_type'],
-        'esm_model_name': config['esm']['model_name'],
-        'esm_unfreeze_layers': config['esm']['unfreeze_layers'],
-        'esm_unfreeze_embeddings': config['esm']['unfreeze_embeddings'],
-        # Quantization and LoRA options
-        'esm_quantization': config['esm'].get('quantization', None),
-        'esm_use_lora': config['esm'].get('use_lora', False),
-        'esm_lora_r': config['esm'].get('lora_r', 8),
-        'esm_lora_alpha': config['esm'].get('lora_alpha', 16),
-        'esm_lora_dropout': config['esm'].get('lora_dropout', 0.1),
-        'esm_lora_target_modules': config['esm'].get('lora_target_modules', None),
-    }
-    return model_config
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Test DinoMHC on Benchmark Datasets",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
-    # Model checkpoint
-    parser.add_argument(
-        "--checkpoint", type=str, required=True,
-        help="Path to model checkpoint (.ckpt file)"
-    )
-
-    # Test data - either single file or multiple files
-    test_group = parser.add_mutually_exclusive_group(required=True)
-    test_group.add_argument(
-        "--test_file", type=str,
-        help="Path to a single test CSV file"
-    )
-    test_group.add_argument(
-        "--test_files", type=str, nargs='+',
-        help="Paths to multiple test CSV files"
-    )
-
-    # Optional config file (can infer from checkpoint if not provided)
-    parser.add_argument(
-        "--config", type=str, default=None,
-        help="Path to config YAML file (will try to infer from checkpoint dir if not provided)"
-    )
-
-    # Output directory
-    parser.add_argument(
-        "--output_dir", type=str, default="test_results",
-        help="Directory to save test results and predictions"
-    )
-
-    # Testing options
-    parser.add_argument(
-        "--batch_size", type=int, default=32,
-        help="Batch size for testing"
-    )
-    parser.add_argument(
-        "--num_workers", type=int, default=4,
-        help="Number of data loading workers"
-    )
-    parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
-        choices=["cuda", "cpu"],
-        help="Device to use for inference"
-    )
-    parser.add_argument(
-        "--num_gpus", type=int, default=1,
-        help="Number of GPUs to use (only valid when device=cuda)"
-    )
-    parser.add_argument(
-        "--strategy", type=str, default="auto",
-        choices=["auto", "dp", "ddp"],
-        help="Multi-GPU strategy: 'dp' (DataParallel), 'ddp' (DistributedDataParallel), 'auto' (auto-select)"
-    )
-    parser.add_argument(
-        "--save_predictions", action="store_true",
-        help="Save predictions to CSV file"
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Enable verbose logging"
-    )
-
-    return parser.parse_args()
-
-
-def infer_config_from_checkpoint(checkpoint_path: str) -> Optional[str]:
-    """Try to find config.yaml in the checkpoint directory."""
-    ckpt_path = Path(checkpoint_path)
-
-    # Try several common locations relative to checkpoint
-    possible_config_paths = [
-        ckpt_path.parent.parent / "config.yaml",  # outputs/exp/fold_X/config.yaml
-        ckpt_path.parent.parent.parent / "config.yaml",  # outputs/exp/config.yaml
-    ]
+def load_model_checkpoint(model, checkpoint_path, device="cuda"):
+    model = model.to(device=device)
     
-    print(possible_config_paths)
+    state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_path)
+    
+    if all(key.startswith("model.") for key in state_dict.keys()):
+        state_dict = {key[len("model."):]: value for key, value in state_dict.items()}
+    
+    model.load_state_dict(state_dict, strict=True)
+    model.to(dtype=torch.bfloat16)
+    model.eval()
 
-    for config_path in possible_config_paths:
-        if config_path.exists():
-            return str(config_path)
-
-    return None
-
-
-def get_test_files(args) -> List[str]:
-    """Get list of test files from args."""
-    if args.test_file:
-        return [args.test_file]
+def load_data_module(benchmark_dataset_path, 
+                     batch_size, 
+                     num_workers, 
+                     model_config,
+                     device):
+    
+    # Set tokenizer type
+    if model_config.get("encoder_type", "esm2").startswith("esm"):
+        tokenizer_type = "esm2"
+    elif model_config.get("encoder_type", "esm2").startswith("prottrans"):
+        tokenizer_type = "prottrans"
     else:
-        return args.test_files
-
-
-def test_benchmark(
-    checkpoint_path: str,
-    test_files: List[str],
-    config: Dict[str, Any],
-    output_dir: str,
-    batch_size: int = 32,
-    num_workers: int = 4,
-    device: str = "cuda",
-    num_gpus: int = 1,
-    strategy: str = "auto",
-    save_predictions: bool = True,
-    verbose: bool = True
-):
-    """
-    Test a model on benchmark datasets.
-
-    Args:
-        checkpoint_path: Path to model checkpoint
-        test_files: List of paths to test CSV files
-        config: Model configuration dict
-        output_dir: Directory to save results
-        batch_size: Batch size for inference
-        num_workers: Number of data loading workers
-        device: Device to use ('cuda' or 'cpu')
-        num_gpus: Number of GPUs to use
-        strategy: Multi-GPU strategy ('auto', 'dp', 'ddp')
-        save_predictions: Whether to save predictions to CSV
-        verbose: Enable verbose output
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+        tokenizer_type = "embedding"
     
-    
-    if verbose:
-        print(f"\n{'='*60}")
-        print("DinoMHC Benchmark Testing")
-        print(f"{'='*60}\n")
-        print(f"Checkpoint: {checkpoint_path}")
-        print(f"Test files: {len(test_files)}")
-        for tf in test_files:
-            print(f"  - {tf}")
-        print(f"Output directory: {output_dir}")
-        print(f"Device: {device}")
-        if device == "cuda" and num_gpus > 1:
-            print(f"GPUs: {num_gpus} (strategy: {strategy})")
-        print()
-
-    # Determine tokenizer type from encoder
-    encoder_type = config['model']['encoder_type']
-    tokenizer_type = 'esm2' if encoder_type in ['esm2', 'esm2_shared'] else 'embedding'
-
-    # Create data module with test files
-    print('====HELLO', config['data']['use_flanks'])
     data_module = MHCPeptideDataModule(
-        data_dir=".",  # Not used for test-only
-        fold=0,  # Not used for test-only
+        data_dir=".", # Not used
+        fold=0, # Not used
         batch_size=batch_size,
         num_workers=num_workers,
         tokenizer_type=tokenizer_type,
-        esm_model_name=config['esm']['model_name'],
-        max_peptide_length=config['data']['max_peptide_length'],
-        max_mhc_length=config['data']['max_mhc_length'],
-        use_flanks=config['data']['use_flanks'],
-        flank_length=config['data']['flank_length'],
-        flank_mask_prob=0.0,
+        esm_model_name=model_config.get("esm_model_name", None),
+        prottrans_model_name=model_config.get("prottrans_model_name", None),
+        max_peptide_length=model_config["max_peptide_length"],
+        max_mhc_length=model_config["max_mhc_length"],
+        use_flanks=model_config["use_flanks"],
+        flank_length=model_config["flank_length"],
+        flank_mask_prob=0,
         binarize_labels=True,
         label_threshold=0.5,
-        test_files=test_files,
-        pin_memory=device == 'cuda'
+        test_files=[benchmark_dataset_path],
+        pin_memory=device.type == "cuda"
     )
-
-    # Setup test datasets
-    data_module.setup('test')
-
-    if verbose:
-        print("Test Dataset Info:")
-        print("-" * 40)
-        for name, dataset in data_module.test_datasets.items():
-            print(f"  {name}: {len(dataset):,} samples")
-        print()
-
-    # Load model from checkpoint
-    if verbose:
-        print("Loading model from checkpoint...")
-
-    # Determine which module class to use based on checkpoint
-    model_config = {'config': get_model_config(config)}
-
-    # Determine the Lightning module class
-    use_allele_balanced_loss = config['loss'].get('use_allele_balanced_loss', False)
-
-    # Check if checkpoint is a DeepSpeed directory or a regular .ckpt file
-    ckpt_path = Path(checkpoint_path)
-    if ckpt_path.is_dir():
-        # DeepSpeed ZeRO shards model weights across multiple files in a directory,
-        # so we need to gather them into a single state dict for inference.
-        from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
-
-        if verbose:
-            print(f"Loading DeepSpeed ZeRO checkpoint from directory: {ckpt_path}")
-
-        # Get consolidated FP32 state dict directly in memory (no intermediate file)
-        state_dict = get_fp32_state_dict_from_zero_checkpoint(str(ckpt_path))
-
-        if use_allele_balanced_loss:
-            from src.lightning_module import DinoMHCWithAlleleBalancedFocalLoss
-            model = DinoMHCWithAlleleBalancedFocalLoss(config=model_config['config'])
-        else:
-            from src.lightning_module import DinoMHCLightningModule
-            model = DinoMHCLightningModule(config=model_config['config'])
-
-        model.load_state_dict(state_dict, strict=True)
-    else:
-        # Regular .ckpt file — use Lightning's load_from_checkpoint
-        if use_allele_balanced_loss:
-            from src.lightning_module import DinoMHCWithAlleleBalancedFocalLoss
-            model = DinoMHCWithAlleleBalancedFocalLoss.load_from_checkpoint(
-                checkpoint_path,
-                map_location=device,
-                config=model_config['config'],
-            )
-        else:
-            from src.lightning_module import DinoMHCLightningModule
-            model = DinoMHCLightningModule.load_from_checkpoint(
-                checkpoint_path,
-                map_location=device,
-                config=model_config['config'],
-            )
-
-    model = model.to(torch.bfloat16)
-    model.eval()
-
-    if verbose:
-        print(f"Model loaded successfully!")
-        print(f"  Encoder: {encoder_type}")
-        print(f"  Task: {model.task_type}")
-        print(f"  Use flanks: {config['data']['use_flanks']}")
-        print()
-
-    # Create trainer for testing
-    callbacks = []
-    if verbose:
-        try:
-            callbacks.append(RichProgressBar())
-        except:
-            pass
-
-    # Configure multi-GPU settings
-    if device == "cuda" and num_gpus > 1:
-        devices = num_gpus
-        # Auto-select best strategy if not specified
-        if strategy == "auto":
-            # DDP is generally better for most cases
-            strategy = "ddp"
-    else:
-        devices = 1
-        strategy = "auto"
-
-    trainer = pl.Trainer(
-        accelerator="gpu" if device == "cuda" else "cpu",
-        devices=devices,
-        strategy=strategy,
-        callbacks=callbacks,
-        enable_progress_bar=verbose,
-        enable_model_summary=False,
-        logger=False
-    )
-
-    # Run testing
-    if verbose:
-        print("Running inference on test datasets...")
-        print()
-
-    test_results = trainer.test(model, data_module)
+    data_module.setup(stage="test")
     
-    # Process and save results
-    if verbose:
-        print("\n" + "="*60)
-        print("Test Results Summary")
-        print("="*60 + "\n")
+    return data_module
 
-    all_results = {}
-
-    # Extract metrics from test results
-    for i, (dataset_name, dataset) in enumerate(data_module.test_datasets.items()):
-        if verbose:
-            print(f"Dataset: {dataset_name}")
-            print("-" * 40)
-
-        # Get per-MHC metrics if available
-        per_mhc_metrics = getattr(model, '_test_per_mhc_metrics', {})
-
-        # Create results dictionary for this dataset
-        result_dict = {
-            'dataset': dataset_name,
-            'n_samples': len(dataset),
-        }
-
-        # Add test metrics from trainer output
-        if test_results and i < len(test_results):
-            test_result = test_results[i] if isinstance(test_results, list) else test_results
-            for key, value in test_result.items():
-                if key.startswith('test/'):
-                    metric_name = key.replace('test/', '')
-                    result_dict[metric_name] = value
-                    if verbose and not key.startswith('test/macro_'):
-                        print(f"  {metric_name}: {value:.4f}")
-
-        # Print macro-averaged per-MHC metrics
-        if verbose and per_mhc_metrics:
-            print(f"\n  Per-MHC Metrics (macro-averaged across {len(per_mhc_metrics)} alleles):")
-            metric_names = ['auroc', 'auprc', 
-                            'accuracy_0.5', 'f1_0.5', 'mcc_0.5', 
-                            'accuracy_opt', 'f1_opt', 'mcc_opt']
-            for metric_name in metric_names:
-                values = [m[metric_name] for m in per_mhc_metrics.values() if metric_name in m]
-                if values:
-                    macro_value = sum(values) / len(values)
-                    print(f"    macro_{metric_name}: {macro_value:.4f}")
-
-        all_results[dataset_name] = result_dict
-
-        # Save per-MHC detailed results
-        if per_mhc_metrics and save_predictions:
-            per_mhc_df = pd.DataFrame.from_dict(per_mhc_metrics, orient='index')
-            per_mhc_csv_path = output_path / f"{dataset_name}_per_mhc_metrics.tsv"
-            per_mhc_df.to_csv(per_mhc_csv_path, index_label='mhc_allele', sep='\t')
-            if verbose:
-                print(f"\n  Per-MHC metrics saved to: {per_mhc_csv_path}")
-
-        if verbose:
-            print()
-
-    # Save aggregated results
-    results_df = pd.DataFrame.from_dict(all_results, orient='index')
-    results_csv_path = output_path / "test_results_summary.csv"
-    results_df.to_csv(results_csv_path, index_label='dataset')
-
-    if verbose:
-        print(f"Summary results saved to: {results_csv_path}")
-
-    # Save predictions if requested
-    if save_predictions and hasattr(model, 'test_predictions') and len(model.test_predictions) > 0:
-        all_preds = torch.cat(model.test_predictions, dim=0).float().numpy()
-        all_targets = torch.cat(model.test_targets, dim=0).float().numpy()
-
-        # Match predictions with original data
-        for i, (dataset_name, dataset) in enumerate(data_module.test_datasets.items()):
-            # Get original dataframe
-            df = dataset.df.copy()
-            df = df.iloc[:len(all_preds)]  # Ensure matching length
-
-            # Add predictions (assuming single dataset for now)
-            if len(data_module.test_datasets) == 1:
-                df['score'] = all_preds
-
-                # Save predictions
-                pred_csv_path = output_path / f"{dataset_name}_predictions.tsv"
-                df.to_csv(pred_csv_path, index=False, sep='\t')
-
-                if verbose:
-                    print(f"Predictions saved to: {pred_csv_path}")
-
-    if verbose:
-        print("\nTesting complete!")
-
-    return all_results
-
-
-def main():
-    """Main testing function."""
-    args = parse_args()
-
-    # Get test files
-    test_files = get_test_files(args)
-
-    # Verify test files exist
-    for test_file in test_files:
-        if not Path(test_file).exists():
-            print(f"Error: Test file not found: {test_file}")
-            sys.exit(1)
-
-    # Verify checkpoint exists (can be a file or a DeepSpeed directory)
-    if not Path(args.checkpoint).exists():
-        print(f"Error: Checkpoint not found: {args.checkpoint}")
-        sys.exit(1)
-
-    # Load or infer config
-    config_path = args.config
-    if config_path is None:
-        if args.verbose:
-            print("Config not provided, trying to infer from checkpoint directory...")
-        config_path = infer_config_from_checkpoint  (args.checkpoint)
-        if config_path is None:
-            print("Error: Could not find config.yaml. Please provide --config explicitly.")
-            sys.exit(1)
-        if args.verbose:
-            print(f"Using config: {config_path}")
-
-    config = load_config(config_path)
-
-    # Run testing
-    results = test_benchmark(
-        checkpoint_path=args.checkpoint,
-        test_files=test_files,
-        config=config,
-        output_dir=args.output_dir,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        device=args.device,
-        num_gpus=args.num_gpus,
-        strategy=args.strategy,
-        save_predictions=args.save_predictions,
-        verbose=args.verbose
-    )
-
+def evaluate_predictions(combined_df, threshold=0.5):
+    y_true = combined_df["label"].values
+    y_scores = combined_df["prediction"].values
+    y_pred = (y_scores >= threshold).astype(int)
+    
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    accuracy = accuracy_score(y_true, y_pred)
+    balanced_acc = balanced_accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    f1 = f1_score(y_true, y_pred)
+    mcc = matthews_corrcoef(y_true, y_pred)
+    auroc = roc_auc_score(y_true, y_scores)
+    auprc = average_precision_score(y_true, y_scores)
+    
+    results = {
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+        "accuracy": float(accuracy),
+        "balanced_accuracy": float(balanced_acc),
+        "precision": float(precision),
+        "recall": float(recall),
+        "specificity": float(specificity),
+        "f1_score": float(f1),
+        "mcc": float(mcc),
+        "auroc": float(auroc),
+        "auprc": float(auprc)
+    }
+    
     return results
 
+def evaluate_predictions_grouped_by_allele(combined_df, threshold=0.5):
+    # Grouped by mhc allele
+    combined_df["predicted_label"] = (combined_df["prediction"] >= threshold).astype(int)
+    results = {}
+    
+    for allele, group in combined_df.groupby("mhc"):
+        y_true = group["label"].values
+        y_pred = group["predicted_label"].values
+        y_scores = group["prediction"].values
+        
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+        accuracy = accuracy_score(y_true, y_pred)
+        balanced_acc = balanced_accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred)
+        recall = recall_score(y_true, y_pred)
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        f1 = f1_score(y_true, y_pred)
+        mcc = matthews_corrcoef(y_true, y_pred)
+        auroc = roc_auc_score(y_true, y_scores, )
+        auprc = average_precision_score(y_true, y_scores)
+        
+        # Special metric: PPV@k
+        def ppv_at_k(y_true, y_scores, k):
+            sorted_indices = np.argsort(y_scores)[::-1]
+            top_k_indices = sorted_indices[:k]
+            return np.sum(y_true[top_k_indices]) / k
+
+        ppv_pos = ppv_at_k(y_true, y_scores, k=np.sum(y_true))
+        
+        results[str(allele)] = {
+            "tn": int(tn),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tp": int(tp),
+            "accuracy": float(accuracy),
+            "balanced_accuracy": float(balanced_acc),
+            "precision": float(precision),
+            "recall": float(recall),
+            "specificity": float(specificity),
+            "f1_score": float(f1),
+            "mcc": float(mcc),
+            "auroc": float(auroc),
+            "auprc": float(auprc),
+            "ppv_pos": float(ppv_pos)
+        }
+        
+    # Calculate average metrics across all alleles
+    results["average"] = {
+        "tn": sum(r["tn"] for r in results.values()) / len(results),
+        "fp": sum(r["fp"] for r in results.values()) / len(results),
+        "fn": sum(r["fn"] for r in results.values()) / len(results),
+        "tp": sum(r["tp"] for r in results.values()) / len(results),
+        "accuracy": sum(r["accuracy"] for r in results.values()) / len(results),
+        "balanced_accuracy": sum(r["balanced_accuracy"] for r in results.values()) / len(results),
+        "precision": sum(r["precision"] for r in results.values()) / len(results),
+        "recall": sum(r["recall"] for r in results.values()) / len(results),
+        "specificity": sum(r["specificity"] for r in results.values()) / len(results),
+        "f1_score": sum(r["f1_score"] for r in results.values()) / len(results),
+        "mcc": sum(r["mcc"] for r in results.values()) / len(results),
+        "auroc": sum(r["auroc"] for r in results.values()) / len(results),
+        "auprc": sum(r["auprc"] for r in results.values()) / len(results),
+        "ppv_pos": sum(r["ppv_pos"] for r in results.values()) / len(results)
+    }
+    
+    return results
+
+def main(args):
+    # Verify existence of paths
+    assert len(args.checkpoints) > 0, "At least one model checkpoint must be provided"
+    assert Path(args.benchmark_dataset).exists(), "Benchmark dataset path does not exist"
+    assert Path(args.model_config).exists(), "Model configuration file does not exist"
+    
+    # Init device
+    device = torch.device(f"{args.device}:{args.device_id}" if args.device == "cuda" else args.device)
+    
+    # Load Model configuration
+    model_config = load_config(args.model_config)
+    print(json.dumps(model_config, indent=4))
+
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    original_df = pd.read_csv(args.benchmark_dataset)
+    max_supported_length = int(model_config["max_peptide_length"])
+
+    base_df, expanded_df = build_inference_df(
+        original_df=original_df,
+        max_supported_length=max_supported_length,
+        centroid_target_length=args.centroid_target_length,
+        n_anchors=args.n_anchors
+    )
+
+    print(f"Original rows: {len(base_df)} | Inference rows: {len(expanded_df)}")
+    
+    if model_config.get("encoder_type", "esm2").startswith("esm"):
+        model = DinoMHC(model_config)
+    else:
+        model = DinoMHC_ProtTrans(model_config)
+    
+    probs_csv_files = []
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=True) as tmp_file:
+        expanded_df.to_csv(tmp_file.name, index=False)
+
+        for idx, checkpoint_path in enumerate(args.checkpoints):
+            print(f"🔄 Evaluating checkpoint {checkpoint_path} ({idx+1}/{len(args.checkpoints)})")
+
+            load_model_checkpoint(model, checkpoint_path, device)
+
+            data_module = load_data_module(tmp_file.name, args.batch_size, args.num_workers, model_config, device)
+
+            probs_csv_file = output_dir / f"probs_{idx}.csv"
+            with open(probs_csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([f"prediction_{checkpoint_path}"])
+
+                total_batches = len(data_module.test_dataloader())
+
+                for batch in tqdm(data_module.test_dataloader(), desc="Evaluating", total=total_batches, unit="batch"):
+                    with torch.no_grad():
+                        outputs = model(
+                            peptide_tokens=batch["peptide_tokens"].to(device),
+                            mhc_tokens=batch["mhc_tokens"].to(device),
+                            peptide_mask=batch["peptide_mask"].to(device),
+                            mhc_mask=batch["mhc_mask"].to(device),
+                            nflank_len=batch["nflank_len"].to(device),
+                            cflank_len=batch["cflank_len"].to(device),
+                            original_peptide_len=batch["original_peptide_len"].to(device),
+                            return_attention=False
+                        )
+
+                    predictions = outputs[f"prediction"].flatten().cpu().float().numpy()
+                    for pred in predictions:
+                        writer.writerow([pred])
+
+            probs_csv_files.append(probs_csv_file)
+        
+    # Combine predictions with original dataset for easier evaluation
+    
+    predictions_dfs = [pd.read_csv(probs_file) for probs_file in probs_csv_files]
+    expanded_combined_df = pd.concat([expanded_df.reset_index(drop=True)] + predictions_dfs, axis=1)
+    prediction_columns = [f"prediction_{cp}" for cp in args.checkpoints]
+    expanded_combined_df["prediction"] = expanded_combined_df[prediction_columns].mean(axis=1)
+
+    combined_df = aggregate_window_predictions(
+        expanded_combined_df=expanded_combined_df,
+        base_df=base_df,
+        prediction_columns=prediction_columns
+    )
+
+    combined_csv_file = output_dir / "full_predictions.csv"
+    combined_df.to_csv(combined_csv_file, index=False)
+    print(f"Saved aggregated predictions to {combined_csv_file}")
+    
+    # Evaluate predictions
+    if args.calculate_by_allele:
+        evaluation_results = evaluate_predictions_grouped_by_allele(combined_df, args.threshold)
+    else:
+        evaluation_results = evaluate_predictions(combined_df, args.threshold)
+        
+    evaluation_results_xlsx_file = output_dir / "evaluation_results.xlsx"
+
+    evaluation_results_df = pd.DataFrame.from_dict(evaluation_results, orient='index')
+    evaluation_results_df.index.name = "mhc"
+    evaluation_results_df = evaluation_results_df.reset_index()
+    evaluation_results_df.to_excel(evaluation_results_xlsx_file, index=False)
+
+    print(f"Saved evaluation results to {evaluation_results_xlsx_file}")
+    
+    # Done testing
+    print("✅ Testing completed successfully.")
+    
+            
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Run testing on benchmark datasets the DinoMHC model",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    
+    # Main arguments
+    parser.add_argument(
+        "--checkpoints",
+        required=True,
+        nargs="+",
+        help="Paths to the model checkpoint files for each fold",
+        type=str
+    )
+    
+    parser.add_argument(
+        "--benchmark_dataset",
+        type=str,
+        required=True,
+        help="Path to the benchmark dataset file (CSV format)"
+    )
+    
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="results/",
+        help="Directory to save the evaluation results"
+    )
+    
+    # Model configuration arguments
+    parser.add_argument(
+        "--model_config",
+        type=str,
+        required=True,
+        help="Path to the model configuration file (YAML format)"
+    )
+    
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Threshold for binary classification when evaluating predictions"
+    )
+    
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=32,
+        help="Batch size for evaluation"
+    )
+    
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="Number of worker processes for data loading"
+    )
+    
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Device to run the evaluation on (e.g., 'cuda' or 'cpu')"
+    )
+    
+    parser.add_argument(
+        "--device_id",
+        type=int,
+        default=0,
+        help="GPU device ID to use if running on CUDA"
+    )
+    
+    # Evaluation arguments
+    parser.add_argument(
+        "--calculate_by_allele",
+        action="store_true",
+        help="Whether to calculate evaluation metrics separately for each MHC allele"
+    )
+    
+    # Handling long sequences exceeding the model's maximum input length
+    parser.add_argument(
+        "--centroid_target_length",
+        type=int,
+        default=9,
+        help="Length to trim peptides to if they exceed the max supported length."
+    )
+
+    parser.add_argument(
+        "--n_anchors",
+        type=int,
+        default=4,
+        help="Number of N-terminal anchors to preserve during centroid trimming."
+    )
+    
+    args = parser.parse_args()
+    
+    # For debugging purposes, print the parsed arguments
+    print(json.dumps(vars(args), indent=4))
+    
+    main(args)
+    
